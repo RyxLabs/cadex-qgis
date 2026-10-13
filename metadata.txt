@@ -27,7 +27,7 @@ email=hello@ryxlabs.dev
 changelog=0.2.0:
     * First public release: CGXML conversion, intravilan / extravilan report, area reduction, comparator for layers and CGXML files, topology check and building topology, each also available in the Processing Toolbox
 tags=cadastre,cadastru,romania,cgxml,ancpi,ocpi,eterra,intravilan,extravilan,parcel,building,topology,dxf,excel,stereo 70,processing
-homepage=https://cadex.ro
+homepage=https://ryxlabs.dev/qgis/cadex
 repository=https://github.com/ryxlabs/cadex-qgis
 tracker=https://github.com/ryxlabs/cadex-qgis/issues
 icon=icons/cadex.svg
