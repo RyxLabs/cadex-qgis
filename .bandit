@@ -1,0 +1,4 @@
+# local scans only (not in the release zip): test/ and scripts/ never ship
+# exceptions are inline "# nosec <id>" with a reason
+[bandit]
+exclude = ./test,./scripts,./dist,./libs,./.git,./__pycache__

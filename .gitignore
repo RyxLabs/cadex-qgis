@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# working notes
+JOURNAL.md
+
+dist/
+*.zip
+
+# QGIS writes a symbology-style.db into its working directory; data/siruta.db ships
+*.db
+!data/siruta.db
+
+# deps.py falls back to pip-installing into <plugin>/libs outside a QGIS profile
+libs/
+
+# Office lock files of an open report
+~$*
+
+.vscode/
+.idea/
+.claude/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

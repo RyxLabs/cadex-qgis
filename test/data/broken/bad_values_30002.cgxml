@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- synthetic: readable, but with values a producer should never write - a text ID and IE, unreadable coordinates, two points only, an unknown SIRUTA code -->
+<CGXML>
+  <Address><ADDRESSID>1</ADDRESSID><SIRSUP>999999</SIRSUP><SIRUTA>abc</SIRUTA></Address>
+  <Land><LANDID>1</LANDID><ADDRESSID>1</ADDRESSID><CADGENNO>30002A</CADGENNO><E2IDENTIFIER>IE-30002</E2IDENTIFIER><CADSECTOR>x</CADSECTOR><MEASUREDAREA>abc</MEASUREDAREA></Land>
+  <Points><POINTID>1</POINTID><IMMOVABLEID>1</IMMOVABLEID><NO>1</NO><X>503000</X><Y>403000</Y></Points>
+  <Points><POINTID>2</POINTID><IMMOVABLEID>1</IMMOVABLEID><NO>2</NO><X>503010</X><Y>403000</Y></Points>
+  <Points><POINTID>3</POINTID><IMMOVABLEID>1</IMMOVABLEID><NO>3</NO><X>not-a-number</X><Y>403010</Y></Points>
+</CGXML>

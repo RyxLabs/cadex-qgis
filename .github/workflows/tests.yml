@@ -1,0 +1,152 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: tests (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container: ${{ matrix.image }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.34 is qgisMinimumVersion, ltr the current long-term release, stable the
+        # current release (QGIS 4, Qt6). nightly is the master build, so its failures
+        # do not fail the workflow.
+        image:
+          - "qgis/qgis:3.34"
+          - "qgis/qgis:ltr"
+          - "qgis/qgis:stable"
+        experimental: [false]
+        include:
+          - image: "qgis/qgis:nightly"
+            experimental: true
+    defaults:
+      run:
+        shell: bash
+    env:
+      QT_QPA_PLATFORM: offscreen
+      LANG: C.UTF-8
+      # a crash prints the Python stack of every thread
+      PYTHONFAULTHANDLER: "1"
+      # the images' system Python is marked externally managed (PEP 668)
+      PIP_BREAK_SYSTEM_PACKAGES: "1"
+    steps:
+      # checkout into a folder named like the python package, so the
+      # tests' sys.path bootstrap (plugins dir = repo parent) resolves
+      # "import cadex" exactly as it does inside a QGIS profile
+      - uses: actions/checkout@v7
+        with:
+          path: cadex
+
+      - name: QGIS version
+        run: python3 -c "from qgis.core import Qgis; print(Qgis.version())"
+
+      # ezdxf in the versions and with the --no-deps install that services/deps.py uses for
+      # CADex's users; numpy is the image's own, as in a QGIS installation. Users install into
+      # a folder of their profile; here --ignore-installed puts the pinned versions beside the
+      # image's Debian packages, which pip cannot uninstall
+      - name: Install optional test dependencies
+        run: |
+          python3 - <<'EOF'
+          import subprocess, sys
+          from cadex.services import deps
+          pip = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+                 "--ignore-installed"]
+          for name, no_deps, companions in deps.PACKAGES.values():
+              specs = [deps.SPECS.get(n, n) for n in [name] + list(companions)]
+              subprocess.run(pip + (["--no-deps"] if no_deps else []) + specs, check=True)
+          EOF
+          python3 -m pip install --disable-pip-version-check openpyxl
+          python3 -c "import ezdxf, openpyxl; print('ezdxf', ezdxf.__version__)"
+
+      # one process per module: QGIS allows a single initQgis/exitQgis
+      # cycle per process, so unittest discover would crash. The exit code
+      # is the module's result; a crash or a hang ends with a non-zero code.
+      - name: Run test modules
+        working-directory: cadex
+        run: |
+          failed=()
+          for t in test/test_*.py; do
+            echo "::group::$t"
+            code=0
+            timeout --kill-after=30 900 python3 "$t" || code=$?
+            echo "::endgroup::"
+            if [ "$code" -ne 0 ]; then
+              echo "::error file=$t::$t exited with code $code"
+              failed+=("$t ($code)")
+            fi
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'failed: %s\n' "${failed[@]}"
+            exit 1
+          fi
+
+  # the release zip and the checks plugins.qgis.org runs on an upload
+  package:
+    name: release zip and upload checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: cadex
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build and extract the release zip
+        run: |
+          python cadex/scripts/build_zip.py "$RUNNER_TEMP/dist"
+          mkdir "$RUNNER_TEMP/release"
+          unzip -q "$RUNNER_TEMP"/dist/cadex.*.zip -d "$RUNNER_TEMP/release"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cadex-release-zip
+          path: ${{ runner.temp }}/dist/cadex.*.zip
+          if-no-files-found: error
+
+      - name: Install the scanners
+        run: python -m pip install --disable-pip-version-check bandit detect-secrets flake8
+
+      # every test at every severity, a superset of the tests plugins.qgis.org selects
+      - name: Bandit
+        run: bandit -r "$RUNNER_TEMP/release/cadex"
+
+      - name: detect-secrets
+        working-directory: ${{ runner.temp }}/release
+        run: |
+          detect-secrets scan --all-files --exclude-files 'metadata\.txt' cadex \
+            > "$RUNNER_TEMP/secrets.json"
+          python - "$RUNNER_TEMP/secrets.json" <<'EOF'
+          import json, sys
+          found = json.load(open(sys.argv[1]))["results"]
+          print(json.dumps(found, indent=1))
+          sys.exit(1 if found else 0)
+          EOF
+
+      - name: flake8
+        run: flake8 --max-line-length=120 "$RUNNER_TEMP/release/cadex"
+
+      # the image and the command plugins.qgis.org checks an upload with. In --dry_run the
+      # script exits 0 even when it reports something, so any output line naming a plugin
+      # file fails the step.
+      - name: Qt6 checker
+        run: |
+          docker run --rm -v "$RUNNER_TEMP/release:/plugin:ro" \
+            ghcr.io/qgis/pyqgis4-checker:main-ubuntu \
+            /usr/local/bin/pyqt5_to_pyqt6.py /plugin --dry_run 2>&1 | tee "$RUNNER_TEMP/qt6.log"
+          if grep -F "/plugin/cadex/" "$RUNNER_TEMP/qt6.log"; then
+            exit 1
+          fi
