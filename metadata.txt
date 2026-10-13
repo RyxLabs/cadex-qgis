@@ -2,25 +2,21 @@
 name=CADex
 qgisMinimumVersion=3.34
 qgisMaximumVersion=4.99
-description=Romanian cadastre tools for CGXML files: conversion to GeoPackage, Shapefile, DXF or Excel, intravilan / extravilan report, proportional area reduction, comparison of two layers or two sets of CGXML files, sector topology check and building topology correction. Every tool is also available in the Processing Toolbox.
+description=Romanian cadastre tools for CGXML files: conversion, comparison, topology checks, intravilan / extravilan report and deed area reduction.
 about=Tools for Romanian systematic cadastre work with CGXML files (ANCPI / OCPI, eTerra). The interface is in Romanian.
 
-    * CGXML conversion: the .cgxml files of a folder, a ZIP archive or a file selection become an imobile (property) layer and a construcții (building) layer, as GeoPackage, Shapefile, DXF with labels or Excel. The columns written, their order and their field names are configurable; Excel headers use the readable column names. Owners and possessors come from property, possession and provisional registrations; every other person in the file is listed in a separate column, with their right or registration. Holes are cut out of the imobil and islands inside holes become separate parts; eTerra exports and deliveries are read with the same rules. From a folder only the .cgxml files are read, and a damaged ZIP archive is reported while the other sources are converted.
-    * Intravilan / extravilan report: the area of every imobil inside and outside the intravilan and its status, as a classified layer and an Excel report with one sheet per status, statistics and unidentified owners.
-    * Area reduction: scales the deed areas of a parcel list proportionally so that they add up to the measured contour area. Parcels with a CF/IE (land book number or electronic identifier) keep their area. Total rows and rows hidden in Excel are left out.
-    * Comparator: two layers matched on a key column, or two sets of CGXML files (folders, ZIP archives or files) paired by file name or by IE. Lists the imobile and construcții added, removed and changed, split by what changed (boundary, data, both, split imobil, boundary not compared), with an optional Excel report.
-    * Topology check: checks cadastral sectors for overlaps or gaps between imobile, unsnapped points and construcții outside their imobil. The data is not modified; the problems are returned as styled layers and an optional Excel file.
-    * Building topology: cuts every construcție that crosses the boundary of its imobil back inside it, part by part, into a new layer that records the area removed.
+    * CGXML conversion: the .cgxml files of a folder, a ZIP archive or a file selection become an imobile (property) layer and a construcții (building) layer, as GeoPackage, Shapefile, DXF with labels or Excel, with the columns and field names you choose.
+    * Intravilan / extravilan report: the area of every imobil inside and outside the intravilan, as a classified layer and an Excel report.
+    * Area reduction: scales the deed areas of a parcel list so that they add up to a measured contour; parcels with a CF/IE (land book number or electronic identifier) keep theirs.
+    * Comparator: two layers, or two sets of CGXML files paired by file name or by IE, with the imobile and construcții added, removed and changed.
+    * Topology check: overlaps, gaps and unsnapped points between imobile, and construcții outside their imobil, returned as styled layers.
+    * Building topology: cuts every construcție that crosses the boundary of its imobil back inside it.
 
-    All computations and results are in Stereo 70 (EPSG:3844). Layers in other coordinate systems are reprojected on the fly, and a layer without a coordinate system is read as Stereo 70. A layer is refused when its coordinates do not fit its coordinate system (degrees in a projected system or without a coordinate system, metres in a geographic one) or, transformed to Stereo 70, do not all lie in Romania.
+    All results are in Stereo 70 (EPSG:3844); layers in other coordinate systems are reprojected. Every tool is also an algorithm in the Processing Toolbox. Layers and fields are preselected by name patterns set in the settings.
 
-    Every tool is also an algorithm in the Processing Toolbox, under CADex, for models, batch processing and scripts. The help panel of each algorithm describes its parameters.
+    The website cadex.ro, by the same author, validates, compares and queries CGXML files in the browser; the validator, the comparator and the predefined queries are free for one file at a time.
 
-    Layers and fields are preselected by name patterns that can be changed in the settings. Several layers can be used for one role, for example imobile split by sector.
-
-    The website cadex.ro, by the same author, works with CGXML files in the browser: it validates them against the ANCPI rules, compares two deliveries, two eTerra exports or an eTerra export with a delivery in full, persons and land book entries included, and runs predefined and custom queries. The validator, the comparator and the predefined queries are free for one file at a time.
-
-    External dependencies: none for most tools. DXF output requires the Python package ezdxf. The plugin can install it into a folder of the QGIS user profile, after asking, without modifying the QGIS installation. It can also be installed with "python -m pip install ezdxf" from the OSGeo4W Shell.
+    Only DXF output needs an extra Python package, ezdxf, which the plugin installs into the QGIS user profile after asking.
 version=0.2.0
 author=RyxLabs
 email=hello@ryxlabs.dev
