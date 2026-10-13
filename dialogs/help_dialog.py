@@ -200,7 +200,7 @@ class HelpDialog(BaseDialog):
             + "</p>"
             + "<p>" + self.tr("Autor") + ": RyxLabs "
             "(<a href='https://ryxlabs.dev'>ryxlabs.dev</a>)<br>"
-            "<a href='mailto:hello@ryxlabs.dev'>hello@ryxlabs.dev</a></p>"
+            + self.tr("Suport") + ": <a href='mailto:suport@cadex.ro'>suport@cadex.ro</a></p>"
             + "<p>" + self.tr("Licență: GNU GPL, versiunea 2 sau mai nouă.") + "<br>"
             + f"<a href='{features.SOURCE_URL}'>"
             + self.tr("Codul sursă și raportarea problemelor") + "</a></p>"

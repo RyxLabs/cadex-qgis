@@ -299,8 +299,8 @@ fișier.
 ### Suport
 
 Problemele și propunerile se trimit pe
-[pagina de probleme](https://github.com/ryxlabs/cadex-qgis/issues). Pentru suport comercial
-sau dezvoltare la comandă, scrieți la hello@ryxlabs.dev.
+[pagina de probleme](https://github.com/ryxlabs/cadex-qgis/issues). Pentru întrebări și
+suport, scrieți la suport@cadex.ro.
 
 ### Licență
 
@@ -594,8 +594,8 @@ at a time.
 ### Support
 
 Report bugs and feature requests on the
-[issue tracker](https://github.com/ryxlabs/cadex-qgis/issues). For commercial support or
-custom development, write to hello@ryxlabs.dev.
+[issue tracker](https://github.com/ryxlabs/cadex-qgis/issues). For questions and support,
+write to suport@cadex.ro.
 
 ### License
 
