@@ -700,8 +700,8 @@ sursa veche la cea nouă.</li>
 diferită nu se socotește modificare a datelor.</li>
 <li>Pentru un export eTerra și o livrare comparați fișierele CGXML, nu layerele convertite: în
 layere lipsesc imobilele eTerra fără coordonate.</li>
-<li>Comparația completă, cu persoane, înscrieri și părțile II și III ale cărții funciare, se
-face pe cadex.ro/comparator.</li>
+<li>Comparația completă, cu persoane, înscrieri și părțile a II-a și a III-a ale cărții
+funciare, se face pe cadex.ro/comparator.</li>
 </ul>
 """),
     "check_topology": QT_TRANSLATE_NOOP("CADex", """
@@ -794,8 +794,8 @@ Majusculele și diacriticele nu contează, iar '*' ține locul oricărui text.</
 <p>Descrierea fiecărui instrument, ce oferă cadex.ro în browser și informații despre plugin.</p>
 """),
     "open_website": QT_TRANSLATE_NOOP("CADex", """
-<p>Deschide cadex.ro, unde lucrați direct cu fișierele CGXML, fără instalare: validatorul,
-rapoartele și comparatorul. Fișierele se prelucrează pe calculatorul dumneavoastră și nu sunt
-trimise nicăieri.</p>
+<p>Deschide cadex.ro, unde lucrați direct cu fișierele CGXML, în browser, fără instalare:
+validatorul, comparatorul, interogările predefinite și interogările personalizate. Fișierele se
+citesc în browser și rămân pe calculatorul dumneavoastră.</p>
 """),
 }

@@ -105,8 +105,8 @@ CATALOG: tuple = (
         icon="cadex.svg",
         hint=QT_TRANSLATE_NOOP(
             "CADex",
-            "Deschide cadex.ro: validator, rapoarte și comparare CGXML în "
-            "browser, gratuite pentru un fișier"),
+            "Deschide cadex.ro: validator, comparator și interogări CGXML în "
+            "browser, gratuite pentru câte un fișier"),
     ),
 )
 

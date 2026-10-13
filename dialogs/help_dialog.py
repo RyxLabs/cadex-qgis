@@ -27,26 +27,30 @@ WEB_TOOLS = (
     (QT_TRANSLATE_NOOP("CADex", "Validator CGXML"), "/validator",
      QT_TRANSLATE_NOOP(
          "CADex",
-         "Verifică fișierele înainte de predare, cu regulile schemei ANCPI și cu "
-         "regulile de validare din Generare CG: peste 40 de verificări, de la "
-         "câmpuri obligatorii lipsă și CNP invalid la cote care depășesc întregul. "
-         "Raportul arată, pentru fiecare fișier, ce este greșit și ce este de făcut.")),
-    (QT_TRANSLATE_NOOP("CADex", "Interogări predefinite"), "/interogari-predefinite",
-     QT_TRANSLATE_NOOP(
-         "CADex",
-         "Nouăsprezece rapoarte gata făcute pe imobile, parcele, construcții, "
-         "proprietari, înscrieri și acte, fiecare exportat în Excel.")),
+         "Verifică fișierele după schema ANCPI și după regulile de validare din "
+         "Generare CG: câmpuri obligatorii lipsă, CNP sau CUI invalid, cote de "
+         "proprietate care depășesc întregul, diferențe între suprafețe, valori "
+         "neadmise de ANCPI. Raportul arată, pentru fiecare fișier, ce este greșit "
+         "și ce este de făcut.")),
     (QT_TRANSLATE_NOOP("CADex", "Comparator"), "/comparator",
      QT_TRANSLATE_NOOP(
          "CADex",
-         "Compară două livrări sau două exporturi eTerra pe parcele, construcții, "
-         "persoane, partea II și partea III, cu fiecare diferență marcată "
-         "'Adăugat', 'Modificat' sau 'Șters'.")),
+         "Compară o sursă veche cu una nouă: două livrări, două exporturi eTerra sau "
+         "un export eTerra cu o livrare. Diferențele sunt listate pentru fiecare "
+         "imobil, pe parcele, construcții, persoane și părțile a II-a și a III-a ale "
+         "cărții funciare, marcate 'Adăugat', 'Modificat' sau 'Șters'.")),
+    (QT_TRANSLATE_NOOP("CADex", "Interogări predefinite"), "/interogari-predefinite",
+     QT_TRANSLATE_NOOP(
+         "CADex",
+         "Listează imobilele, parcelele, construcțiile, persoanele, actele și "
+         "înscrierile din fișiere, de exemplu parcelele din intravilan și din "
+         "extravilan, construcțiile fără acte sau proprietarii neidentificați. "
+         "Orice tabel se poate exporta în Excel.")),
     (QT_TRANSLATE_NOOP("CADex", "Interogări personalizate"), "/interogari-personalizate",
      QT_TRANSLATE_NOOP(
          "CADex",
          "Construiți interogarea: ce se listează, condițiile legate prin ȘI "
-         "sau SAU și coloanele. Disponibile cu licență.")),
+         "sau SAU și coloanele. Disponibile doar cu licență.")),
 )
 
 ROLE = Qt.ItemDataRole.UserRole
@@ -160,10 +164,11 @@ class HelpDialog(BaseDialog):
         parts = [
             "<h3>" + self.tr("CADex Online") + "</h3>",
             "<p>" + self.tr(
-                "Pe cadex.ro lucrați direct cu fișierele CGXML, fără instalare. "
-                "Fișierele se prelucrează pe calculatorul dumneavoastră și nu "
-                "sunt trimise nicăieri. Pentru un fișier, validatorul, rapoartele "
-                "și comparatorul sunt gratuite, cu export complet în Excel.") + "</p>",
+                "Pe cadex.ro lucrați direct cu fișierele CGXML, în browser, fără "
+                "instalare. Fișierele se citesc în browser și rămân pe calculatorul "
+                "dumneavoastră. Validatorul și interogările predefinite sunt gratuite "
+                "când lucrați cu câte un fișier, iar comparatorul, când comparați un "
+                "fișier vechi cu unul nou.") + "</p>",
         ]
         for name, path, text in WEB_TOOLS:
             parts.append(f"<p><b><a href='{features.WEBSITE}{path}'>{self.tr(name)}</a></b><br>"

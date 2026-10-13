@@ -190,8 +190,8 @@ class CompareDialog(BaseDialog):
         self.body.addWidget(out)
         self.body.addStretch()
 
-        self.set_tip(self.tr("Comparația completă a două livrări, cu persoane, înscrieri și "
-                             "părțile II și III, o faceți pe"),
+        self.set_tip(self.tr("Comparația completă, cu persoane, înscrieri și părțile a II-a "
+                             "și a III-a ale cărții funciare, o faceți pe"),
                      features.WEBSITE_COMPARATOR, "cadex.ro/comparator")
         self.run_btn = self.add_run_buttons(self.tr("Compară"), self._run)
 

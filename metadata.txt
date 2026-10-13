@@ -18,7 +18,7 @@ about=Tools for Romanian systematic cadastre work with CGXML files (ANCPI / OCPI
 
     Layers and fields are preselected by name patterns that can be changed in the settings. Several layers can be used for one role, for example imobile split by sector.
 
-    The website cadex.ro, by the same author, validates CGXML deliveries against the ANCPI rules, runs predefined reports and compares two deliveries in full, persons and land book entries included. It is free for a single file.
+    The website cadex.ro, by the same author, works with CGXML files in the browser: it validates them against the ANCPI rules, compares two deliveries, two eTerra exports or an eTerra export with a delivery in full, persons and land book entries included, and runs predefined and custom queries. The validator, the comparator and the predefined queries are free for one file at a time.
 
     External dependencies: none for most tools. DXF output requires the Python package ezdxf. The plugin can install it into a folder of the QGIS user profile, after asking, without modifying the QGIS installation. It can also be installed with "python -m pip install ezdxf" from the OSGeo4W Shell.
 version=0.2.0

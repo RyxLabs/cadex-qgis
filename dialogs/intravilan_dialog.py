@@ -114,7 +114,8 @@ class IntravilanDialog(BaseDialog):
         self.body.addWidget(out_group)
 
         self.set_tip(self.tr("Parcelele din intravilan și din extravilan se pot lista și "
-                             "direct din fișierele CGXML, cu rapoartele gratuite de pe"),
+                             "direct din fișierele CGXML, cu interogările predefinite "
+                             "gratuite de pe"),
                      features.WEBSITE_REPORTS, "cadex.ro")
         self.run_btn = self.add_run_buttons(self.tr("Generează"), self._run)
 

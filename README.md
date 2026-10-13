@@ -153,8 +153,8 @@ Fișierele se potrivesc după aceleași reguli ca pe cadex.ro:
   ca apărut sau dispărut.
 
 Pentru fiecare imobil găsit în ambele seturi se compară coloanele alese, limita și
-construcțiile, după numărul lor. Persoanele, înscrierile și părțile II și III ale cărții
-funciare se compară pe [cadex.ro/comparator](https://cadex.ro/comparator).
+construcțiile, după numărul lor. Persoanele, înscrierile și părțile a II-a și a III-a ale
+cărții funciare se compară pe [cadex.ro/comparator](https://cadex.ro/comparator).
 
 Înainte de comparare, valorile se aduc la aceeași formă:
 
@@ -291,8 +291,10 @@ vectorială pentru QGIS, util și în lucrările de cadastru: acroșare într-un
 topologic cu layere de erori, împărțirea unui poligon în suprafețe exacte, import DXF/DWG,
 export DXF și KMZ și copii de siguranță automate, cu versiuni.
 
-[CADex Online](https://cadex.ro) este o platformă în care livrările CGXML se validează, se
-interoghează și se compară direct în browser.
+[CADex Online](https://cadex.ro) este o platformă în care fișierele CGXML se validează, se
+compară și se interoghează direct în browser: Validator CGXML, Comparator, Interogări
+predefinite și Interogări personalizate. Primele trei sunt gratuite când lucrați cu câte un
+fișier.
 
 ### Suport
 
@@ -584,8 +586,10 @@ that is also useful in cadastre work: one-click snapping, a topology validator w
 layers, splitting a polygon into exact target areas, DXF/DWG import, DXF and KMZ export and
 versioned automatic backups.
 
-[CADex Online](https://cadex.ro) is a platform where CGXML deliveries are validated, queried and
-compared directly in the browser.
+[CADex Online](https://cadex.ro) is a platform where CGXML files are validated, compared and
+queried directly in the browser: Validator CGXML, Comparator, Interogări predefinite (predefined
+queries) and Interogări personalizate (custom queries). The first three are free for one file
+at a time.
 
 ### Support
 
