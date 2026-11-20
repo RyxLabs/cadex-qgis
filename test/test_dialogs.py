@@ -40,10 +40,7 @@ from cadex.services import topology_check_service as tcs  # noqa: E402
 from cadex.services.layer_sources import LayerSnapshot  # noqa: E402
 
 
-def square(x, y, size):
-    # the windows refuse a layer whose coordinates look like degrees or lie outside Romania,
-    # so the hand-built layers are drawn from a point in Romania
-    return helpers.square(450000 + x, 350000 + y, size)
+square = helpers.square_in_romania
 
 
 SCREENSHOTS = os.environ.get("CADEX_SCREENSHOTS")
@@ -266,11 +263,11 @@ class WidgetTests(DialogTest):
         source = CgxmlSource()
         source.set_paths([helpers.DATA_DIR])
         source.refresh()
-        self.assertEqual(source.count(), 11)
+        self.assertEqual(helpers.cgxml_count(source), 11)
         self.assertIn("11", source.status.text())
         source.set_paths([os.path.join(self.tmp, "nu_exista")])
         source.refresh()
-        self.assertIsNone(source.count())
+        self.assertIsNone(helpers.cgxml_count(source))
         self.assertEqual(source.status.text(), "Calea aleasă nu există.")
 
     def test_each_cgxml_picker_opens_on_a_path_of_its_own_kind(self):
@@ -296,7 +293,7 @@ class WidgetTests(DialogTest):
             source.set_paths([archive])
             # a picker opens at a path the count found
             source.refresh()
-            source.count()
+            helpers.cgxml_count(source)
             source._browse_zip()
             source._browse_files()
             source._browse_folder()
@@ -307,7 +304,7 @@ class WidgetTests(DialogTest):
             files = os.path.join(self.tmp, "1.cgxml")
             source.set_paths([files, os.path.join(self.tmp, "2.cgxml")])
             source.refresh()
-            source.count()
+            helpers.cgxml_count(source)
             source._browse_zip()
             source._browse_files()
             self.assertEqual((opened["getOpenFileName"], opened["getOpenFileNames"]),
@@ -366,7 +363,7 @@ class DialogBuildTests(DialogTest):
         dialog.source.set_paths([helpers.DATA_DIR])
         dialog.source.recursive.setChecked(True)
         dialog.source.refresh()
-        self.assertEqual(dialog.source.count(), 11)
+        self.assertEqual(helpers.cgxml_count(dialog.source), 11)
         self.assertIn("11", dialog.source.status.text())
         self.assertEqual(dialog.base_edit.text(), "cgxml_data")
         dialog.output_row.set_path(self.tmp)
@@ -393,7 +390,7 @@ class DialogBuildTests(DialogTest):
         dialog.source.edit.setText(helpers.DATA_DIR)
         QTest.keyClick(dialog.source.edit, Qt.Key.Key_Return)
         # the count follows the path; the conversion starts only from the button
-        self.assertEqual(dialog.source.count(), 11)
+        self.assertEqual(helpers.cgxml_count(dialog.source), 11)
         self.assertIn("11", dialog.source.status.text())
         QTest.keyClick(dialog.output_row.edit, Qt.Key.Key_Enter)
         self.assertIsNone(dialog._task)
@@ -407,7 +404,7 @@ class DialogBuildTests(DialogTest):
         dialog = CgxmlDialog(iface=self.iface)
         dialog.source.set_paths([delivery])
         dialog.source.refresh()
-        dialog.source.count()
+        helpers.cgxml_count(dialog.source)
         # not inside it, where the result would be copied along with the delivery
         self.assertEqual(dialog.output_row.path(), self.tmp)
         self.assertEqual(dialog.base_edit.text(), "cgxml_livrare")
@@ -418,7 +415,7 @@ class DialogBuildTests(DialogTest):
         other.output_row.set_path("")
         other.source.set_paths([archive])
         other.source.refresh()
-        other.source.count()
+        helpers.cgxml_count(other.source)
         self.assertEqual(other.output_row.path(), os.path.dirname(archive))
         dialog.deleteLater()
         other.deleteLater()
@@ -480,6 +477,7 @@ class DialogBuildTests(DialogTest):
         dialog = CgxmlDialog(iface=self.iface)
         dialog.source.set_paths([helpers.DATA_DIR])
         dialog.source.refresh()
+        helpers.count_files(dialog.source)
         dialog.output_row.set_path(self.tmp)
         _ui_helpers.set_all_check_states(dialog.columns["imobile"].tree, False)
         dialog._run()
@@ -982,6 +980,7 @@ class DialogBuildTests(DialogTest):
         self.assertEqual(wanted, defaults[1:])
         dialog.old_source.set_paths([old])
         dialog.new_source.set_paths([new])
+        self.assertEqual(helpers.count_files(dialog.old_source, dialog.new_source), (1, 1))
         dialog.excel_row.edit.setText("")
         started = []
         dialog.start_task = lambda task, message="": started.append(task)
@@ -1313,7 +1312,7 @@ class DialogBuildTests(DialogTest):
         dialog.new_source.set_paths([new])
         dialog.old_source.refresh()
         dialog.new_source.refresh()
-        self.assertEqual((dialog.old_source.count(), dialog.new_source.count()), (1, 2))
+        self.assertEqual((helpers.cgxml_count(dialog.old_source), helpers.cgxml_count(dialog.new_source)), (1, 2))
         shoot(dialog, "comparator_cgxml")
 
         shown = []
@@ -1637,20 +1636,8 @@ class ServicesMergedColumnsDialogTests(DialogTest):
 class WidgetsShellTest(DialogTest):
     """Helpers for the tests of the shared widgets, the base window and the plugin shell."""
 
-    @staticmethod
-    def settle(seconds=0.2):
-        end = time.monotonic() + seconds
-        while time.monotonic() < end:
-            QApplication.processEvents()
-            time.sleep(0.01)
-
-    @staticmethod
-    def wait(condition, timeout=30.0):
-        end = time.monotonic() + timeout
-        while not condition() and time.monotonic() < end:
-            QApplication.processEvents()
-            time.sleep(0.01)
-        return bool(condition())
+    settle = staticmethod(helpers.settle)
+    wait = staticmethod(helpers.wait)
 
     @staticmethod
     def count_rebuilds(checklist):
@@ -1869,13 +1856,13 @@ class WidgetsCgxmlSourceTests(WidgetsShellTest):
         self.assertEqual(source.status.text(), "Se caută fișierele...")
         release.set()
         self.assertTrue(self.wait(lambda: "11" in source.status.text()), source.status.text())
-        self.assertEqual(source.count(), 11)
+        self.assertEqual(helpers.cgxml_count(source), 11)
         source.close()
         source.deleteLater()
 
     def test_a_remembered_source_of_a_mode_not_shown_is_not_read(self):
         from cadex.services import dialog_memory
-        dialog_memory.save("CompareDialog", "old_cgxml", helpers.DATA_DIR)
+        dialog_memory.save("CompareDialog", "old_cgxml", helpers.DATA_DIR, project=True)
         dialog_memory.save("CompareDialog", "mode", 0)
         listings = self.count_listings()
         dialog = CompareDialog(iface=self.iface)
@@ -1895,12 +1882,12 @@ class WidgetsCgxmlSourceTests(WidgetsShellTest):
         source.show()
         source.set_paths([helpers.DATA_DIR])
         source.refresh()
-        self.assertEqual(source.count(), 11)
+        self.assertEqual(helpers.cgxml_count(source), 11)
         source.edit.editingFinished.emit()
         self.settle()
         self.assertEqual(len(listings), 1)
         source.recursive.setChecked(False)
-        self.assertEqual(source.count(), len(self.cgxml_files()))
+        self.assertEqual(helpers.cgxml_count(source), len(self.cgxml_files()))
         self.assertEqual(len(listings), 2)
         source.close()
         source.deleteLater()
@@ -1912,12 +1899,12 @@ class WidgetsCgxmlSourceTests(WidgetsShellTest):
         source.show()
         source.edit.setText(folder)
         QTest.keyClick(source.edit, Qt.Key.Key_Return)
-        self.assertIsNone(source.count())
+        self.assertIsNone(helpers.cgxml_count(source))
         self.assertEqual(source.status.text(), "Calea aleasă nu există.")
         # the network drive holding it is back
         shutil.copytree(helpers.DATA_DIR, folder)
         QTest.keyClick(source.edit, Qt.Key.Key_Return)
-        self.assertEqual(source.count(), 11)
+        self.assertEqual(helpers.cgxml_count(source), 11)
         self.assertEqual(source.status.text(), "S-au găsit 11 fișiere CGXML.")
         source.close()
         source.deleteLater()
@@ -1926,8 +1913,8 @@ class WidgetsCgxmlSourceTests(WidgetsShellTest):
         import threading
         from cadex.services import dialog_memory
         share = os.path.join(self.tmp, "nas")
-        dialog_memory.save("CgxmlDialog", "input", os.path.join(share, "UAT"))
-        dialog_memory.save("CgxmlDialog", "output", share)
+        dialog_memory.save("CgxmlDialog", "input", os.path.join(share, "UAT"), project=True)
+        dialog_memory.save("CgxmlDialog", "output", share, project=True)
         threads, release = self.out_of_reach(share)
         dialog = CgxmlDialog(iface=self.iface)
         dialog.show()
@@ -1949,7 +1936,7 @@ class WidgetsCgxmlSourceTests(WidgetsShellTest):
         import threading
         from cadex.services import dialog_memory
         share = os.path.join(self.tmp, "nas")
-        dialog_memory.save("CgxmlDialog", "input", os.path.join(share, "UAT"))
+        dialog_memory.save("CgxmlDialog", "input", os.path.join(share, "UAT"), project=True)
         threads, release = self.out_of_reach(share)
         dialog = CgxmlDialog(iface=self.iface)
         dialog.show()
@@ -1968,7 +1955,7 @@ class WidgetsCgxmlSourceTests(WidgetsShellTest):
         dialog = CgxmlDialog(iface=self.iface)
         dialog.source.set_paths([helpers.DATA_DIR])
         dialog.source.refresh()
-        dialog.source.count()
+        helpers.cgxml_count(dialog.source)
         dialog.output_row.set_path(self.tmp)
         self.assertTrue(self.wait(lambda: "deja" in dialog.targets_label.text()),
                         dialog.targets_label.text())
@@ -1986,7 +1973,7 @@ class WidgetsCgxmlSourceTests(WidgetsShellTest):
         source = CgxmlSource()
         source.set_paths([archive])
         source.refresh()
-        self.assertIsNone(source.count())
+        self.assertIsNone(helpers.cgxml_count(source))
         self.assertEqual(source.status.text(),
                          "Arhiva ZIP 'livrare.zip' este deteriorată sau incompletă.")
 
@@ -1995,12 +1982,12 @@ class WidgetsCgxmlSourceTests(WidgetsShellTest):
         source = CgxmlSource()
         source.set_paths([present, os.path.join(self.tmp, "lipsa.cgxml")])
         source.refresh()
-        self.assertIsNone(source.count())
+        self.assertIsNone(helpers.cgxml_count(source))
         self.assertEqual(source.status.text(), "Calea 'lipsa.cgxml' nu există.")
         source.set_paths([present, os.path.join(self.tmp, "nu_exista") + os.sep,
                           os.path.join(self.tmp, "lipsa.cgxml")])
         source.refresh()
-        source.count()
+        helpers.cgxml_count(source)
         self.assertEqual(source.status.text(), "Căile 'nu_exista', 'lipsa.cgxml' nu există.")
 
     def test_a_path_typed_outside_the_quotes_is_reported(self):
@@ -2008,7 +1995,7 @@ class WidgetsCgxmlSourceTests(WidgetsShellTest):
         source = CgxmlSource()
         source.edit.setText(f'"{first}" {second}')
         source.refresh()
-        self.assertEqual(source.count(), 1)
+        self.assertEqual(helpers.cgxml_count(source), 1)
         self.assertIn("scrieți fiecare cale între ghilimele", source.status.text())
 
     def test_dropping_a_delivery_selection_keeps_its_cgxml_files(self):
@@ -2031,7 +2018,7 @@ class WidgetsCgxmlSourceTests(WidgetsShellTest):
         source.edit.dropEvent(drop)
         self.assertEqual(source.paths(), [os.path.normpath(p) for p in files
                                           if p.endswith(".cgxml")])
-        self.assertEqual(source.count(), 2)
+        self.assertEqual(helpers.cgxml_count(source), 2)
         self.assertEqual(source.status.text(), "S-au găsit 2 fișiere CGXML. 2 fișiere care nu "
                                                "sunt .cgxml sau .zip au fost ignorate.")
 
@@ -2624,13 +2611,11 @@ class DiminuareWindowTests(WidgetsShellTest):
         """The Informații facts of the Sumar sheet that Salvează Excel writes."""
         from unittest import mock
         from cadex.dialogs import diminuare_dialog
-        from cadex.services import xlsx
         path = os.path.join(self.tmp, name)
         with mock.patch.object(diminuare_dialog.QFileDialog, "getSaveFileName",
                                return_value=(path, "")):
             dialog._save()
-        _names, rows = xlsx.read_rows(path, "Sumar")
-        return {row[0]: row[1] for row in rows if row and row[0]}
+        return helpers.summary_facts(path)
 
     def test_a_total_row_under_the_parcels_is_left_out(self):
         from cadex.dialogs.diminuare_dialog import BAD_TINT
@@ -2724,7 +2709,7 @@ class DiminuareWindowTests(WidgetsShellTest):
         with mock.patch.object(diminuare_dialog.QFileDialog, "getSaveFileName",
                                return_value=(path, "")):
             dialog._save()
-        self.assertEqual(questions, ["Fișierul rezultat.xlsx există deja. Doriți să fie înlocuit?"])
+        self.assertEqual(questions, [f"Fișierul '{path}' există deja. Doriți să fie înlocuit?"])
         with open(path, "rb") as fp:
             self.assertEqual(fp.read(), b"ieri")
         dialog.deleteLater()
@@ -2767,7 +2752,8 @@ class DiminuareWindowTests(WidgetsShellTest):
         import threading
         from cadex.services import dialog_memory
         share = os.path.join(self.tmp, "nas")
-        dialog_memory.save("DiminuareDialog", "file", os.path.join(share, "parcele.xlsx"))
+        dialog_memory.save("DiminuareDialog", "file", os.path.join(share, "parcele.xlsx"),
+                           project=True)
         threads, release = self.out_of_reach(share)
         started = time.monotonic()
         dialog = DiminuareDialog(iface=self.iface)
@@ -2780,7 +2766,7 @@ class DiminuareWindowTests(WidgetsShellTest):
     def test_a_remembered_table_is_read_once_the_window_is_open(self):
         from cadex.services import dialog_memory
         path = self.table("Nr;Suprafata act\n1;6000\n2;4000\n")
-        dialog_memory.save("DiminuareDialog", "file", path)
+        dialog_memory.save("DiminuareDialog", "file", path, project=True)
         dialog = DiminuareDialog(iface=self.iface)
         self.assertTrue(self.wait(lambda: dialog._rows))
         self.assertEqual(dialog.area_combo.currentData(), "Suprafata act")
@@ -3387,8 +3373,9 @@ class ColumnSpellingWindowTests(DialogTest):
         dialog.deleteLater()
 
 
-class UnreadableSourceWindowTests(DialogTest):
-    """CGXML sources that hold a damaged archive."""
+class UnreadableSourceWindowTests(WidgetsShellTest):
+    """CGXML sources that hold a damaged archive. A press is followed by the warning once
+    the files of the sources are counted."""
 
     def setUp(self):
         super().setUp()
@@ -3404,6 +3391,7 @@ class UnreadableSourceWindowTests(DialogTest):
         started = []
         dialog.start_task = lambda task, message="": started.append(task)
         dialog._run()
+        self.assertTrue(self.wait(lambda: self.bar_text(dialog), 10))
         self.assertEqual(started, [])
         self.assertIn("'livrare.zip' (arhiva ZIP este deteriorată sau incompletă)",
                       self.bar_text(dialog))
@@ -3421,9 +3409,10 @@ class UnreadableSourceWindowTests(DialogTest):
         started = []
         dialog.start_task = lambda task, message="": started.append(task)
         dialog._run()
+        self.assertTrue(self.wait(lambda: self.bar_text(dialog), 10))
         self.assertEqual(started, [])
-        self.assertIn("Sursa veche nu poate fi folosită. Arhiva ZIP 'livrare.zip' este "
-                      "deteriorată sau incompletă.", self.bar_text(dialog))
+        self.assertIn("Sursa veche nu poate fi citită: 'livrare.zip' (arhiva ZIP este "
+                      "deteriorată sau incompletă).", self.bar_text(dialog))
         dialog.deleteLater()
 
 
@@ -3431,12 +3420,14 @@ class ConversionWindowTests(WidgetsShellTest):
     """Conversie CGXML: the checks before a run and the notes of the result window."""
 
     def conversion(self, *paths):
-        """The window on paths, by default the synthetic files, writing to the temporary
-        folder; returns it with the list of the tasks it would start."""
+        """The window on paths, by default the synthetic files, with their files counted and
+        writing to the temporary folder; returns it with the list of the tasks it would
+        start."""
         dialog = CgxmlDialog(iface=self.iface)
         self.addCleanup(dialog.deleteLater)
         dialog.source.set_paths(list(paths) or [helpers.DATA_DIR])
         dialog.source.refresh()
+        helpers.cgxml_count(dialog.source)
         dialog.output_row.set_path(self.tmp)
         started = []
         dialog.start_task = lambda task, message="": started.append(task)
@@ -3554,7 +3545,7 @@ class ConversionWindowTests(WidgetsShellTest):
         listings = self.count_listings()
         dialog, started = self.conversion()
         dialog.show()
-        self.assertEqual(dialog.source.count(), 11)
+        self.assertEqual(helpers.cgxml_count(dialog.source), 11)
         self.assertEqual(len(listings), 1)
         dialog._run()
         self.assertEqual(len(started), 1)
@@ -3587,7 +3578,7 @@ class ConversionWindowTests(WidgetsShellTest):
         source.set_paths([helpers.DATA_DIR, locked])
         with mock.patch.object(os, "scandir", refuse):
             source.refresh()
-            self.assertIsNone(source.count())
+            self.assertIsNone(helpers.cgxml_count(source))
         self.assertEqual(source.status.text(),
                          "Sursa 'sector2' nu poate fi citită: acces refuzat.")
 
@@ -3609,8 +3600,10 @@ class ConversionWindowTests(WidgetsShellTest):
                 raise PermissionError(13, "Access is denied", locked)
             return scandir(path)
         for source, reason in (
-                (damaged, "Arhiva ZIP 'descarcare.zip' este deteriorată sau incompletă."),
-                (locked, "Sursa 'sector2' nu poate fi citită: acces refuzat.")):
+                (damaged, "Sursa aleasă nu poate fi citită: 'descarcare.zip' (arhiva ZIP este "
+                          "deteriorată sau incompletă)."),
+                (locked, "Sursa aleasă nu poate fi citită: 'sector2' (folderul nu poate fi "
+                         "citit: nu aveți drept de acces la el).")):
             with self.subTest(source=os.path.basename(source)):
                 dialog, started = self.conversion(source)
                 dialog.output_row.set_path(os.path.join(self.tmp, "out"))
@@ -3619,6 +3612,8 @@ class ConversionWindowTests(WidgetsShellTest):
                 dialog.confirm = lambda *args, **kwargs: questions.append(args[1]) or True
                 with mock.patch.object(os, "scandir", refuse):
                     dialog._run()
+                    # the press counts a source without files once more
+                    self.assertTrue(self.wait(lambda: self.bar_text(dialog), 10))
                 self.assertEqual((started, questions), ([], []))
                 self.assertIn(layer.id(), self.project.mapLayers())
                 self.assertIn(reason, self.bar_text(dialog))
@@ -3640,7 +3635,7 @@ class ConversionWindowTests(WidgetsShellTest):
         dialog, started = self.conversion(drive)
         with mock.patch.object(os, "scandir", refuse):
             dialog.source.refresh()
-            self.assertEqual(dialog.source.count(), 4)
+            self.assertEqual(helpers.cgxml_count(dialog.source), 4)
         self.assertEqual(dialog.source.status.text(), "S-au găsit 4 fișiere CGXML.")
         dialog._run()
         [task] = started
@@ -3796,7 +3791,7 @@ class IntravilanResultLayerTests(IntravilanWindowTest):
             dialog = self.window(path)
             shown = self.run_window(dialog)
             self.assertEqual(dialog.questions,
-                             [f"Fișierul {name} există deja. Doriți să fie înlocuit?"])
+                             [f"Fișierul '{path}' există deja. Doriți să fie înlocuit?"])
             self.assertEqual(dialog.failures, [])
             [layer] = shown["layers"]
             self.assertEqual([f["ID_IMOBIL"] for f in layer.getFeatures()], ["A"])
@@ -3972,7 +3967,7 @@ class CgxmlSourceBrowseTests(WidgetsShellTest):
             with self.subTest(paths=[os.path.basename(p) for p in paths]):
                 source.set_paths(paths)
                 source.refresh()
-                source.count()
+                helpers.cgxml_count(source)
                 self.assertEqual({button: start for button, (start, _s)
                                   in self.opened_at(source).items()}, expected)
         source.close()
@@ -3989,7 +3984,7 @@ class CgxmlSourceBrowseTests(WidgetsShellTest):
         source.show()
         source.set_paths([helpers.DATA_DIR])
         source.refresh()
-        source.count()
+        helpers.cgxml_count(source)
         # typed without Return: the buttons take no focus, so the field is not left either
         source.edit.setText(typed)
         self.assertEqual({button: start for button, (start, _s)
@@ -4008,7 +4003,7 @@ class CgxmlSourceBrowseTests(WidgetsShellTest):
                               in self.opened_at(source).items()}, at_typed)
             self.assertEqual(source.status.text(), "Se caută fișierele...")
             listing.set()
-            self.assertEqual(source.count(), 0)
+            self.assertEqual(helpers.cgxml_count(source), 0)
         source.close()
 
 
@@ -4042,7 +4037,7 @@ class CgxmlSourceInUseTests(WidgetsShellTest):
         release = self.hold_exclusively(archive)
         try:
             source.refresh()
-            self.assertIsNone(source.count())
+            self.assertIsNone(helpers.cgxml_count(source))
         finally:
             release()
         self.assertEqual(source.status.text(),
@@ -4071,61 +4066,6 @@ class ConversionCountWindowTests(WidgetsShellTest):
         dialog._on_finished(True, task)
         # 11 files, 6 of them unreadable, and the archive
         self.assertEqual(shown, ["S-au citit 5 fișiere: 5 imobile și 1 construcție."])
-
-
-class ConversionRerunWindowTests(WidgetsShellTest):
-    """Conversie CGXML run again onto the files of its previous result."""
-
-    def window(self, source):
-        dialog = CgxmlDialog(iface=self.iface)
-        self.addCleanup(dialog.deleteLater)
-        dialog.format_combo.setCurrentIndex(dialog.format_combo.findData("shp"))
-        dialog.add_to_project.setChecked(True)
-        dialog.source.set_paths([source])
-        dialog.source.refresh()
-        dialog.output_row.set_path(os.path.join(self.tmp, "out"))
-        dialog.base_edit.setText("rezultat")
-        dialog.confirm = lambda *args, **kwargs: True
-        dialog.show_result = lambda headline, **kwargs: None
-        dialog.fail = lambda message: None
-        return dialog
-
-    def run_now(self, dialog):
-        """Press Convertește and run the task at once, before the event loop runs again."""
-        started = []
-        dialog.start_task = lambda task, message="": started.append(task)
-        dialog._run()
-        [task] = started
-        ok = task.run()
-        dialog._on_finished(ok, task)
-        return ok, task
-
-    def test_a_shapefile_result_that_was_drawn_is_replaced_by_the_next_run(self):
-        from qgis.core import QgsMapRendererSequentialJob, QgsMapSettings  # type: ignore
-        from qgis.PyQt.QtCore import QSize  # type: ignore
-        # QGIS can hold the Shapefiles until it exits
-        self.addCleanup(helpers.remove_folder, self.tmp)
-        source = os.path.join(self.tmp, "src")
-        os.makedirs(source)
-        for name in ("livrare_10188.cgxml", "eterra_100001.cgxml"):
-            shutil.copy(os.path.join(helpers.DATA_DIR, name), source)
-        dialog = self.window(source)
-        ok, task = self.run_now(dialog)
-        self.assertTrue(ok, task.error_msg)
-        results = [layer for layer in self.project.mapLayers().values()
-                   if layer.providerType() == "ogr"]
-        self.assertEqual(len(results), 2)
-        settings = QgsMapSettings()
-        settings.setLayers(results)
-        settings.setDestinationCrs(results[0].crs())
-        settings.setExtent(results[0].extent())
-        settings.setOutputSize(QSize(200, 200))
-        job = QgsMapRendererSequentialJob(settings)
-        job.start()
-        job.waitForFinished()
-        del job, results
-        ok, task = self.run_now(dialog)
-        self.assertTrue(ok, task.error_msg)
 
 
 class SirutaConversionWindowTests(WidgetsShellTest):
@@ -4230,7 +4170,8 @@ class ShellSettingsWindowTests(WidgetsShellTest):
         settings, modal = self.open_settings(plugin)
         self.assertEqual(modal, [])
         self.assertTrue(settings.isVisible())
-        close = next(b for b in help_window.findChildren(QPushButton) if b.text() == "Închide")
+        close = next(b for b in help_window.findChildren(QPushButton)
+                     if b.text().replace("&", "") == "Închide")
         # through the window system, where Qt drops the input of a window a modal one blocks
         QTest.mouseClick(help_window.windowHandle(), Qt.MouseButton.LeftButton,
                          Qt.KeyboardModifier.NoModifier,

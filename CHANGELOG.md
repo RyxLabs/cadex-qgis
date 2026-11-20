@@ -1,0 +1,99 @@
+# Changelog
+
+What changed in CADex for its users, newest version first. The entries of the newest version,
+under the same headings, are also the `changelog` of `metadata.txt`, which the QGIS Plugin
+Manager shows, and the notes of its GitHub release.
+
+A version still in progress is headed `## <version> - unreleased`; on release day,
+`unreleased` is replaced with the date (YYYY-MM-DD).
+
+## 0.3.0 - unreleased
+
+### Added
+
+- Topologie Construcții has a tolerance, 'Ieșire construcții' in the window and 'Cât poate ieși
+  construcția din imobil' in Processing (1 cm by default): a construcție is cut when one of its
+  points lies more than the tolerance outside its imobil, or a part of it wider than the
+  tolerance lies outside it. Verificare Topologică reports by the same rule.
+- Verificare Topologică reports the gaps enclosed by imobile of two or more sectors, as warnings.
+- Conversie CGXML warns when the area built from the coordinates differs by more than 1 mp from
+  the measured area written in the file.
+- Diminuare Suprafețe states the surplus when the contour is larger than the sum of the deed
+  areas, in the window, in the Excel report and as the Processing output SURPLUS.
+- Comparator (layere) in Processing: when the key columns are left empty, the keys the window
+  would preselect are used, and with 'Compară și coloanele' off only the geometry is compared.
+
+### Changed
+
+- DXF is written with GDAL, which QGIS includes, so CADex needs no extra Python package and no
+  longer installs ezdxf. Labels are MTEXT. The folder cadex_libs that version 0.2.0 created in
+  the QGIS profile is not used any more and can be deleted.
+- Diminuare Suprafețe never increases areas: with a contour larger than the sum of the deed areas
+  they stay as they are, and rounding gives no parcel more than its deed area.
+- Comparator: the rules for an eTerra export against a delivery apply when exactly one of the two
+  sources is an eTerra export, whichever way the files are paired, and the result names the
+  source taken as the export. Two deliveries paired by IE are compared as two deliveries.
+- The points of a CGXML outline are joined in the order of their POINTID.
+- Output paths, source paths and columns picked by hand are remembered for the project they were
+  used in, and the question before replacing a file shows its full path. Paths that version 0.2.0
+  remembered for every project are not offered again: pick each of them again in the project
+  that uses it.
+- The letters ş and ţ written with a cedilla are the same as ș and ț in every comparison.
+- DXF: an imobil's label is placed where none of its construcții stand, and construcție labels
+  are at most 1.5 m high, so labels seldom lie on top of each other.
+- Shapefile text columns are 254 bytes wide for the address, persons and notes, 80 for names and
+  numbers and 20 for codes, or as wide as a longer value, so the files are about half the size
+  they were in 0.2.0 and every column can still be filled in later.
+
+### Fixed
+
+- Verificare Topologică with sector outlines reported imobile as lying outside their sector, and
+  whole sectors as not covered, when a neighbour's corner lay a fraction of a millimetre beside
+  an edge. Raport Intravilan could class an imobil inside the contour as extravilan for the same
+  reason.
+- After a check of CGXML files, Verificare Topologică kept '(numărul elementului)' and '(un
+  singur sector)' as if the user had chosen them, so later checks of layers lost the IDs of the
+  imobile and the rule for the roads sector.
+- Verificare Topologică: outlines without a sector column, outlines of sectors that are not among
+  the checked imobile and gaps shared by two outlines gave false or repeated findings. The check
+  with outlines is several times faster and Cancel takes effect at once.
+- Verificare Topologică in Processing stops with a message, instead of reporting no problem, when
+  not one imobil of the chosen layer or files could be checked.
+- Conversie CGXML: an outline whose first point is written twice lost that corner; a number too
+  long for a 64-bit field stopped the whole conversion; a chosen source that does not exist was
+  left out without a message; parcels, construcții and points numbered for another imobil than
+  the only one in the file were dropped without a message.
+- Comparator: whole numbers of ten digits and more that differ in their last digits counted as
+  equal; point and line layers never showed a moved geometry; two owners with the same name
+  counted as one; the window and Processing chose different keys for the same layers.
+- Diminuare Suprafețe left a parcel out as a total row when its owner or a remark held the word
+  'total'; 'N/A', 'nu are', 'lipsă' and '?' counted as a CF/IE; the window stopped responding on
+  tables of a thousand rows and more.
+- Raport Intravilan: with tolerance 0, imobile inside the contour were classed as partial; a
+  contour layer of two large polygons ran for tens of minutes; an imobil wholly on one side
+  showed 1 mp on the other; the totals of the Sumar sheet added up rounded rows.
+- Excel reports holding characters that XML does not allow could not be opened, and whole numbers
+  of twelve digits and more lost digits. Tables with dates, a hidden first sheet or formatted
+  cells far from the data, and CSV files with a title line or without separators at the end of a
+  line, were read wrongly.
+- A run that ends after another project was opened no longer adds its layers to that project.
+- A model that passes the layers of 'Conversie CGXML' to the other CADex algorithms finds their
+  ID, sector and construcție columns.
+- The windows follow a change of the QGIS theme; keyboard focus is visible on the switch between
+  modes; path fields and icon buttons have names for screen readers; buttons and labels have Alt
+  shortcuts.
+- Conversie CGXML, Verificare Topologică and the Comparator no longer stop responding while a
+  folder on a slow or network drive is listed: the listing runs in the background and the run
+  starts once the files are found.
+- Diminuare Suprafețe chose a column remembered from another table, even one the user had not
+  picked, for the deed areas and for CF/IE.
+- Verificare Topologică and Topologie Construcții forgot '(după suprapunere)' chosen for the
+  imobil of the construcții.
+- A CGXML file with a DOCTYPE is refused, and a ZIP member larger than its header declares is no
+  longer read into memory.
+
+## 0.2.0 - 2026-10-13
+
+- First public release: CGXML conversion, intravilan / extravilan report, area reduction,
+  comparator for layers and CGXML files, topology check and building topology, each also
+  available in the Processing Toolbox.

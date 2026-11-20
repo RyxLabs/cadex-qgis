@@ -78,8 +78,8 @@ class ResultDialog(QDialog):
         top = QHBoxLayout()
         top.setSpacing(12)
         icon = QLabel()
-        icon.setPixmap(_ui_helpers.theme_icon(
-            "/mIconWarning.svg" if warning else "/mIconSuccess.svg").pixmap(28, 28))
+        icon.setPixmap(_ui_helpers.icon_pixmap(_ui_helpers.theme_icon(
+            "/mIconWarning.svg" if warning else "/mIconSuccess.svg"), 28))
         top.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
         texts = QVBoxLayout()
         texts.setSpacing(6)

@@ -27,6 +27,39 @@ def net_area(parts):
                for part in parts)
 
 
+def document(*rows) -> bytes:
+    """A CGXML document holding the given element rows."""
+    return ("<?xml version='1.0' encoding='utf-8'?>\n<CGXML>\n" + "\n".join(rows)
+            + "\n</CGXML>").encode("utf-8")
+
+
+def land(values="", land_id=1):
+    """A Land element with CADGENNO 501 and the given further elements."""
+    return f"<Land><LANDID>{land_id}</LANDID><CADGENNO>501</CADGENNO>{values}</Land>"
+
+
+def building(building_id=7, number=1, land_id="<LANDID>1</LANDID>", values=""):
+    return (f"<Building><BUILDINGID>{building_id}</BUILDINGID>{land_id}"
+            f"<BUILDNO>{number}</BUILDNO>{values}</Building>")
+
+
+def points(coordinates, owner="<IMMOVABLEID>1</IMMOVABLEID>", first=1, numbers=None, ids=None):
+    """Points elements with POINTID counting up from first, or the matching entry of ids; NO
+    is the same count, or the matching entry of numbers."""
+    rows = []
+    for index, (x, y) in enumerate(coordinates):
+        point_id = ids[index] if ids else first + index
+        number = numbers[index] if numbers else first + index
+        rows.append(f"<Points><POINTID>{point_id}</POINTID>{owner}<NO>{number}</NO>"
+                    f"<X>{x}</X><Y>{y}</Y></Points>")
+    return rows
+
+
+# a 10 m square and a 2 m square inside it, in Stereo 70
+A, B, C, D = (500000, 400000), (500010, 400000), (500010, 400010), (500000, 400010)
+E, F, G, H = (500002, 400002), (500004, 400002), (500004, 400004), (500002, 400004)
+
+
 class EterraExportTests(unittest.TestCase):
 
     def setUp(self):
@@ -185,7 +218,7 @@ class BrokenFileTests(unittest.TestCase):
         self.assertEqual(len(imobile), 1)
 
     def test_external_entity_is_never_resolved(self):
-        self.assert_refused("external_entity.cgxml", "entitate")
+        self.assert_refused("external_entity.cgxml", "DOCTYPE")
 
     def test_other_xml(self):
         self.assert_refused("not_cgxml.cgxml", "nu este un fișier CGXML")
@@ -283,20 +316,6 @@ class ConversionReaderTests(unittest.TestCase):
     """Values written by a script, outlines that enclose no area, provisional and possession
     entries, and co-owners who share a name."""
 
-    SQUARE = [(500000, 400000), (500010, 400000), (500010, 400010), (500000, 400010)]
-
-    @staticmethod
-    def cgxml(*rows) -> bytes:
-        """A CGXML document with one Land, LANDID 1, and the given element rows."""
-        return ("<?xml version='1.0' encoding='utf-8'?>\n<CGXML>\n" + "\n".join(rows)
-                + "\n</CGXML>").encode("utf-8")
-
-    @staticmethod
-    def points(owner_tag, owner_id, coordinates):
-        return [f"<Points><POINTID>{n}</POINTID><{owner_tag}>{owner_id}</{owner_tag}>"
-                f"<NO>{n}</NO><X>{x}</X><Y>{y}</Y></Points>"
-                for n, (x, y) in enumerate(coordinates, 1)]
-
     @staticmethod
     def registration(reg_id, kind, right, part=2):
         return (f"<Registration><REGISTRATIONID>{reg_id}</REGISTRATIONID>"
@@ -314,11 +333,11 @@ class ConversionReaderTests(unittest.TestCase):
 
     def test_nan_and_inf_are_reported_like_any_value_that_is_not_a_number(self):
         # a script writing an empty spreadsheet cell as "nan" or "inf"
-        corners = [self.SQUARE[0], ("nan", 400000), self.SQUARE[2], self.SQUARE[3]]
-        data = self.cgxml(
+        corners = [A, ("nan", 400000), C, D]
+        data = document(
             "<Land><LANDID>1</LANDID><CADGENNO>nan</CADGENNO><E2IDENTIFIER>inf</E2IDENTIFIER>"
             "<MEASUREDAREA>NaN</MEASUREDAREA></Land>",
-            *self.points("IMMOVABLEID", 1, corners))
+            *points(corners))
         [land], _constructii, warnings = reader.parse_bytes(data, "1.cgxml")
         self.assertIsNone(land["id"])
         self.assertIsNone(land["ie"])
@@ -330,14 +349,14 @@ class ConversionReaderTests(unittest.TestCase):
                       "nu a fost construită", warnings)
 
     def test_points_that_enclose_no_area_are_reported(self):
-        bowtie = [self.SQUARE[0], self.SQUARE[2], self.SQUARE[1], self.SQUARE[3]]
-        for coordinates in (bowtie, self.SQUARE[:2]):
-            data = self.cgxml(
+        bowtie = [A, C, B, D]
+        for coordinates in (bowtie, [A, B]):
+            data = document(
                 "<Land><LANDID>1</LANDID><CADGENNO>501</CADGENNO></Land>",
                 "<Building><BUILDINGID>7</BUILDINGID><LANDID>1</LANDID>"
                 "<BUILDNO>1</BUILDNO></Building>",
-                *self.points("IMMOVABLEID", 1, coordinates),
-                *self.points("BUILDINGID", 7, coordinates))
+                *points(coordinates),
+                *points(coordinates, owner="<BUILDINGID>7</BUILDINGID>"))
             [land], [building], warnings = reader.parse_bytes(data, "501.cgxml")
             with self.subTest(points=len(coordinates)):
                 self.assertEqual((land["rings"], building["rings"]), ([], []))
@@ -348,7 +367,7 @@ class ConversionReaderTests(unittest.TestCase):
                     "construită"])
 
     def test_a_provisional_or_possession_entry_keeps_its_right(self):
-        data = self.cgxml(
+        data = document(
             "<Land><LANDID>1</LANDID><CADGENNO>501</CADGENNO></Land>",
             self.registration(1, "PROVISIONALENTRY", "IPOTECA", 3),
             self.registration(2, "POSESION_REGISTATION", "CONCESIUNE"),
@@ -363,7 +382,7 @@ class ConversionReaderTests(unittest.TestCase):
                          "STAN MIHAI (înscriere provizorie)")
 
     def test_co_owners_with_the_same_name_are_each_listed(self):
-        data = self.cgxml(
+        data = document(
             "<Land><LANDID>1</LANDID><CADGENNO>501</CADGENNO></Land>",
             self.registration(1, "INTAB", "PROPRIETATE"),
             self.registration(2, "INTAB", "PROPRIETATE"),
@@ -376,6 +395,432 @@ class ConversionReaderTests(unittest.TestCase):
             self.person(5, 2, "POPA", "ANA", "0000000000000"))
         [land], _constructii, _warnings = reader.parse_bytes(data, "501.cgxml")
         self.assertEqual(land["propr"], "POPA ION, POPA ION, POPA ANA")
+
+
+def shapes(coordinates):
+    """(the ring sizes of each part, the area, the warnings) of an imobil with these points."""
+    [record], _constructii, warnings = reader.parse_bytes(
+        document(land(), *points(coordinates)), "501.cgxml")
+    return [[len(ring) for ring in part] for part in record["rings"]], \
+        net_area(record["rings"]), warnings
+
+
+class RepeatedPointTests(unittest.TestCase):
+    """A point written twice in a row is one corner, wherever it stands in the outline."""
+
+    def test_the_first_point_written_twice_is_one_corner(self):
+        self.assertEqual(shapes([A, A, B, C, D]), ([[4]], 100.0, []))
+        self.assertEqual(shapes([A, A, B, C, D, A]), ([[4]], 100.0, []))
+
+    def test_the_closing_point_written_twice_is_not_a_corner_of_the_next_outline(self):
+        self.assertEqual(shapes([A, B, C, D, A, A, E, F, G, H, E]), ([[4, 4]], 96.0, []))
+
+    def test_the_first_point_of_a_hole_written_twice_is_one_corner(self):
+        self.assertEqual(shapes([A, B, C, D, A, E, E, F, G, H, E]), ([[4, 4]], 96.0, []))
+
+
+class OutlineSplitTests(unittest.TestCase):
+    """The points of an imobil are split into its outlines: an outline ends where its first
+    point comes again, the last one may be left open, a point written twice in a row is one
+    corner, and an outline may start on the corner where the one before it closed."""
+
+    # 50 mp triangles: A B C, two more that start on A and touch the others only there, and
+    # one apart
+    N, P = (499990, 400000), (499990, 399990)
+    Q, R = (500010, 399990), (500000, 399990)
+    K, L, M = (500100, 400100), (500110, 400100), (500110, 400110)
+    # two triangular holes of the square A B C D, of 10.5 and 2 mp; the first starts on A
+    S, T = (500005, 400002), (500002, 400005)
+    U, V, W = (500006, 400006), (500008, 400006), (500008, 400008)
+
+    SQUARE, HOLE = [A, B, C, D], [E, F, G, H]
+    CASES = (
+        ("one outline left open", [A, B, C, D], [SQUARE]),
+        ("one closed outline", [A, B, C, D, A], [SQUARE]),
+        ("closed outlines one after another",
+         [A, B, C, D, A, E, F, G, H, E, K, L, M, K], [SQUARE, HOLE, [K, L, M]]),
+        ("a closed outline, then one left open", [A, B, C, D, A, E, F, G, H], [SQUARE, HOLE]),
+        ("the first point twice, left open", [A, A, B, C, D], [SQUARE]),
+        ("the first point twice, closed", [A, A, B, C, D, A], [SQUARE]),
+        ("the first point of the second outline twice",
+         [A, B, C, D, A, E, E, F, G, H, E], [SQUARE, HOLE]),
+        ("the first point of the second outline twice, left open",
+         [A, B, C, D, A, E, E, F, G, H], [SQUARE, HOLE]),
+        ("a middle point twice, left open", [A, B, B, C, D], [SQUARE]),
+        ("a middle point twice, closed", [A, B, C, C, D, A], [SQUARE]),
+        ("the last point twice, left open", [A, B, C, D, D], [SQUARE]),
+        ("the last point before the closing one twice", [A, B, C, D, D, A], [SQUARE]),
+        ("the closing point twice", [A, B, C, D, A, A], [SQUARE]),
+        ("the closing point twice, an outline after it",
+         [A, B, C, D, A, A, E, F, G, H, E], [SQUARE, HOLE]),
+        ("the closing point twice, two outlines after it",
+         [A, B, C, D, A, A, E, F, G, H, E, K, L, M, K], [SQUARE, HOLE, [K, L, M]]),
+        ("the closing point of every outline twice",
+         [A, B, C, D, A, A, E, F, G, H, E, E, K, L, M, K, K], [SQUARE, HOLE, [K, L, M]]),
+        ("a point twice before the closing point, the closing point twice, a point twice in "
+         "the next outline", [A, B, C, D, D, A, A, E, F, G, G, H, E], [SQUARE, HOLE]),
+        ("every point twice",
+         [A, A, B, B, C, C, D, D, A, A, E, E, F, F, G, G, H, H, E, E], [SQUARE, HOLE]),
+        ("two outlines that start on one corner",
+         [A, B, C, A, A, N, P, A], [[A, B, C], [A, N, P]]),
+        ("two outlines that start on one corner, an outline after them",
+         [A, B, C, A, A, N, P, A, K, L, M, K], [[A, B, C], [A, N, P], [K, L, M]]),
+        ("three outlines that start on one corner, an outline after them",
+         [A, B, C, A, A, N, P, A, A, Q, R, A, K, L, M, K],
+         [[A, B, C], [A, N, P], [A, Q, R], [K, L, M]]),
+        ("two outlines that start on one corner, the second left open",
+         [A, B, C, A, A, N, P], [[A, B, C], [A, N, P]]),
+        ("the second outline starts on the corner of the first, written twice",
+         [A, B, C, A, A, A, N, P, A, K, L, M, K], [[A, B, C], [A, N, P], [K, L, M]]),
+        ("a hole that starts on the first corner of its outline, a hole after it",
+         [A, B, C, D, A, A, S, T, A, U, V, W, U], [SQUARE, [A, S, T], [U, V, W]]),
+        ("an outline that ends where the next one starts, that corner written once",
+         [A, B, C, A, N, P, A], [[A, B, C], [N, P, A]]),
+        ("two points", [A, B], []),
+        ("no points", [], []),
+    )
+
+    def test_each_way_of_writing_the_outlines(self):
+        for title, written, outlines in self.CASES:
+            with self.subTest(title):
+                self.assertEqual(reader.split_rings(written), outlines)
+
+    def test_parts_that_start_on_one_corner_are_each_a_part(self):
+        written = [A, B, C, A, A, self.N, self.P, A, self.K, self.L, self.M, self.K]
+        self.assertEqual(shapes(written), ([[3], [3], [3]], 150.0, []))
+
+    def test_a_hole_that_starts_on_the_first_corner_of_its_outline_is_a_hole(self):
+        written = [A, B, C, D, A, A, self.S, self.T, A, self.U, self.V, self.W, self.U]
+        self.assertEqual(shapes(written), ([[4, 3, 3]], 87.5, []))
+
+
+class PointOrderTests(unittest.TestCase):
+    """The points of an imobil or a construcție are joined in POINTID order; NO is only the
+    name of a point."""
+
+    def read(self, *rows):
+        imobile, constructii, warnings = reader.parse_bytes(
+            document(land(), *rows), "501.cgxml")
+        return imobile[0], constructii, warnings
+
+    def test_numbers_that_start_again_at_each_outline_do_not_mix_the_outlines(self):
+        record, _constructii, warnings = self.read(
+            *points([A, B, C, D, A], numbers=[1, 2, 3, 4, 5]),
+            *points([E, F, G, H, E], first=6, numbers=[1, 2, 3, 4, 5]))
+        self.assertEqual(record["rings"], [[[A, B, C, D], [E, F, G, H]]])
+        self.assertEqual(warnings, [])
+
+    def test_points_listed_out_of_order_are_joined_by_pointid(self):
+        first, second, third, fourth = points([A, B, C, D], numbers=["d", "c", "b", "a"])
+        record, _constructii, _warnings = self.read(third, first, fourth, second)
+        self.assertEqual(record["rings"], [[[A, B, C, D]]])
+
+    def test_without_a_distinct_whole_pointid_on_every_point_the_order_of_the_file_is_kept(self):
+        for ids in (["7", "7", "7", "7"], ["4", "3", "", "1"], ["4", "3", "3,5", "1"]):
+            with self.subTest(ids=ids):
+                record, _constructii, _warnings = self.read(
+                    *points([A, B, C, D], ids=ids, numbers=[4, 3, 2, 1]))
+                self.assertEqual(record["rings"], [[[A, B, C, D]]])
+
+    def test_a_point_with_a_building_id_belongs_to_the_building(self):
+        record, [construction], warnings = self.read(
+            building(), *points([A, B, C, D]),
+            *points([E, F, G, H], first=10,
+                    owner="<IMMOVABLEID>1</IMMOVABLEID><BUILDINGID>7</BUILDINGID>"))
+        self.assertEqual(record["rings"], [[[A, B, C, D]]])
+        self.assertEqual(construction["rings"], [[[E, F, G, H]]])
+        self.assertEqual(warnings, [])
+
+
+class LinkTests(unittest.TestCase):
+    """A parcel, a construcție or a point that does not carry the LANDID of the file's only
+    imobil is read as that imobil's and reported."""
+
+    PARCEL = ("<Parcel><PARCELID>1</PARCELID>{link}<USECATEGORY>CC</USECATEGORY>"
+              "<INTRAVILAN>true</INTRAVILAN><LANDPLOTNO>12</LANDPLOTNO>"
+              "<PARCELNO>345</PARCELNO><TITLENO>77</TITLENO></Parcel>")
+    BUILDING_POINTS = points([E, F, G, H], owner="<BUILDINGID>7</BUILDINGID>", first=10)
+
+    def test_a_parcel_without_the_id_of_the_imobil_is_read_as_its_parcel(self):
+        for link in ("", "<LANDID>9</LANDID>"):
+            with self.subTest(link=link):
+                [record], _constructii, warnings = reader.parse_bytes(
+                    document(land(), self.PARCEL.format(link=link)), "501.cgxml")
+                self.assertEqual(
+                    (record["tip_teren"], record["nr_tarla"], record["nr_parcele"],
+                     record["categ_fol"], record["nr_titlu"]),
+                    ("Intravilan", "12", "345", "CC", "77"))
+                self.assertEqual(warnings, ["1 parcelă nu are LANDID-ul imobilului și a fost "
+                                            "citită ca parcelă a lui"])
+
+    def test_a_building_without_the_id_of_the_imobil_is_read_as_its_building(self):
+        registration = (
+            "<Registration><REGISTRATIONID>1</REGISTRATIONID>"
+            "<REGISTRATIONTYPE>INTAB</REGISTRATIONTYPE><RIGHTTYPE>PROPRIETATE</RIGHTTYPE>"
+            "<LBPARTNO>2</LBPARTNO></Registration>"
+            "<RegistrationXEntity><REGISTRATIONID>1</REGISTRATIONID>"
+            "<BUILDINGID>7</BUILDINGID></RegistrationXEntity>"
+            "<Person><PERSONID>1</PERSONID><REGISTRATIONID>1</REGISTRATIONID>"
+            "<FIRSTNAME>DAN</FIRSTNAME><LASTNAME>RADU</LASTNAME></Person>")
+        for link in ("", "<LANDID>9</LANDID>"):
+            with self.subTest(link=link):
+                [record], [construction], warnings = reader.parse_bytes(
+                    document(land(), building(land_id=link), registration,
+                             *points([A, B, C, D]), *self.BUILDING_POINTS), "501.cgxml")
+                self.assertEqual((construction["id"], construction["nr_constr"],
+                                  construction["propr"]), (501, "C1", "RADU DAN"))
+                self.assertEqual(construction["rings"], [[[E, F, G, H]]])
+                self.assertEqual(record["alte_pers"], "RADU DAN (proprietate, C1)")
+                self.assertEqual(warnings, ["1 construcție nu are LANDID-ul imobilului și a "
+                                            "fost citită ca a lui"])
+
+    def test_points_without_the_id_of_the_imobil_are_read_as_its_points(self):
+        for owner in ("", "<IMMOVABLEID>9</IMMOVABLEID>"):
+            with self.subTest(owner=owner):
+                [record], _constructii, warnings = reader.parse_bytes(
+                    document(land(), *points([A, B, C, D], owner=owner)), "501.cgxml")
+                self.assertEqual(record["rings"], [[[A, B, C, D]]])
+                self.assertEqual(warnings, ["4 puncte nu au IMMOVABLEID-ul imobilului și au "
+                                            "fost citite ca puncte ale lui"])
+
+    def test_points_of_a_building_that_is_not_in_the_file_are_left_out(self):
+        [record], constructii, warnings = reader.parse_bytes(
+            document(land(), *points([A, B, C, D]), *self.BUILDING_POINTS), "501.cgxml")
+        self.assertEqual((record["rings"], constructii), ([[[A, B, C, D]]], []))
+        self.assertEqual(warnings, ["4 puncte au BUILDINGID-ul unei construcții care nu este "
+                                    "în fișier și nu au fost folosite"])
+
+    def test_a_building_id_of_zero_on_a_point_of_the_imobil_names_no_building(self):
+        zero = points([A, B, C, D], owner="<IMMOVABLEID>1</IMMOVABLEID><BUILDINGID>0</BUILDINGID>")
+        [record], constructii, warnings = reader.parse_bytes(
+            document(land(), *zero), "501.cgxml")
+        self.assertEqual((record["rings"], constructii, warnings), ([[[A, B, C, D]]], [], []))
+        [record], [construction], warnings = reader.parse_bytes(
+            document(land(), building(), *zero, *self.BUILDING_POINTS), "501.cgxml")
+        self.assertEqual((record["rings"], construction["rings"], warnings),
+                         ([[[A, B, C, D]]], [[[E, F, G, H]]], []))
+
+    def test_an_immovable_id_of_zero_on_a_point_of_a_building_names_no_imobil(self):
+        [record], [construction], warnings = reader.parse_bytes(
+            document(land(), building(), *points([A, B, C, D]),
+                     *points([E, F, G, H], first=10,
+                             owner="<IMMOVABLEID>0</IMMOVABLEID><BUILDINGID>7</BUILDINGID>")),
+            "501.cgxml")
+        self.assertEqual((record["rings"], construction["rings"], warnings),
+                         ([[[A, B, C, D]]], [[[E, F, G, H]]], []))
+
+    def test_the_points_of_a_building_with_the_id_zero_are_its_points(self):
+        [record], [construction], warnings = reader.parse_bytes(
+            document(land(), building(building_id=0), *points([A, B, C, D]),
+                     *points([E, F, G, H], first=10, owner="<BUILDINGID>0</BUILDINGID>")),
+            "501.cgxml")
+        self.assertEqual((record["rings"], construction["rings"], warnings),
+                         ([[[A, B, C, D]]], [[[E, F, G, H]]], []))
+
+    def test_in_a_file_with_several_imobile_an_element_without_their_ids_is_left_out(self):
+        imobile, constructii, warnings = reader.parse_bytes(
+            document(land(), land(land_id=2), self.PARCEL.format(link=""),
+                     building(land_id="<LANDID>9</LANDID>"),
+                     *points([A, B, C, D], owner="")), "501.cgxml")
+        self.assertEqual([(r["tip_teren"], r["rings"]) for r in imobile], [("", []), ("", [])])
+        self.assertEqual(constructii, [])
+        self.assertEqual(warnings, [
+            "1 parcelă nu are LANDID-ul unui imobil din fișier și nu a fost citită",
+            "1 construcție nu are LANDID-ul unui imobil din fișier și nu a fost citită",
+            "4 puncte nu au IMMOVABLEID-ul unui imobil din fișier și nu au fost folosite"])
+
+
+class CoordinateRangeTests(unittest.TestCase):
+    """Coordinates that are not Stereo 70 metres in Romania give no geometry."""
+
+    def outline(self, coordinates):
+        [record], [construction], warnings = reader.parse_bytes(
+            document(land(), building(), *points(coordinates),
+                     *points(coordinates, owner="<BUILDINGID>7</BUILDINGID>", first=10)),
+            "501.cgxml")
+        return record, construction, warnings
+
+    def test_an_outline_in_degrees_gives_no_geometry_and_names_the_point(self):
+        record, construction, warnings = self.outline(
+            [(25.1, 45.1), (25.2, 45.1), (25.2, 45.2), (25.1, 45.2)])
+        self.assertEqual((record["rings"], construction["rings"]), ([], []))
+        # not counted with the records whose file holds no coordinates
+        self.assertTrue(record["_has_points"] and construction["_has_points"])
+        self.assertEqual(warnings, [
+            "punctul 1 are coordonate în afara României, deci geometria imobilului nu a fost "
+            "construită",
+            "punctul 10 are coordonate în afara României, deci geometria construcției nu a "
+            "fost construită"])
+
+    def test_a_point_left_at_zero_gives_no_geometry(self):
+        record, construction, warnings = self.outline([A, B, (0, 0), C, D])
+        self.assertEqual((record["rings"], construction["rings"]), ([], []))
+        self.assertIn("punctul 3 are coordonate în afara României, deci geometria imobilului "
+                      "nu a fost construită", warnings)
+
+    def test_coordinates_at_the_corners_of_romania_are_read(self):
+        # the extent of EPSG:3844's area of use, land and sea, in its own metres
+        for x, y in ((116400, 215600), (1018900, 771870)):
+            with self.subTest(x=x, y=y):
+                [record], _constructii, warnings = reader.parse_bytes(document(
+                    land(), *points([(x, y), (x + 10, y), (x + 10, y + 10), (x, y + 10)])),
+                    "501.cgxml")
+                self.assertEqual((len(record["rings"]), warnings), (1, []))
+
+
+class DoctypeTests(unittest.TestCase):
+    """A CGXML file declares no document type, which is where a file defines entities that
+    expand to many times their size."""
+
+    TEXT = ("<?xml version='1.0' encoding='{encoding}'?>{doctype}<CGXML><Land>"
+            "<LANDID>1</LANDID><CADGENNO>501</CADGENNO><NOTES>{note}</NOTES></Land></CGXML>")
+    ENTITY = "<!DOCTYPE CGXML [<!ENTITY nota \"" + "a" * 1000 + "\">]>"
+
+    def test_a_file_that_declares_a_document_type_is_refused(self):
+        for encoding in ("utf-8", "utf-16"):
+            with self.subTest(encoding=encoding):
+                data = self.TEXT.format(encoding=encoding, doctype=self.ENTITY,
+                                        note="&nota;" * 100).encode(encoding)
+                with self.assertRaises(reader.CgxmlError) as refused:
+                    reader.parse_bytes(data, "501.cgxml")
+                self.assertIn("DOCTYPE", str(refused.exception))
+
+    def test_a_document_type_without_entities_is_refused_too(self):
+        data = self.TEXT.format(encoding="utf-8", doctype="<!DOCTYPE CGXML>", note="x")
+        with self.assertRaises(reader.CgxmlError):
+            reader.parse_bytes(data.encode("utf-8"), "501.cgxml")
+
+    def test_the_word_in_a_note_is_not_a_declaration(self):
+        for encoding in ("utf-8", "utf-16"):
+            with self.subTest(encoding=encoding):
+                data = self.TEXT.format(encoding=encoding, doctype="",
+                                        note="fără DOCTYPE, cu ș și ț").encode(encoding)
+                [record], _constructii, _warnings = reader.parse_bytes(data, "501.cgxml")
+                self.assertEqual((record["id"], record["note"]),
+                                 (501, "fără DOCTYPE, cu ș și ț"))
+
+
+class NumberTests(unittest.TestCase):
+    """A number is read with every digit, and a value that is not a number is left empty and
+    reported with its field."""
+
+    @staticmethod
+    def identified(cadgenno, ie):
+        return document(f"<Land><LANDID>1</LANDID><E2IDENTIFIER>{ie}</E2IDENTIFIER>"
+                        f"<CADGENNO>{cadgenno}</CADGENNO></Land>")
+
+    def test_a_long_identifier_keeps_every_digit(self):
+        [record], _constructii, warnings = reader.parse_bytes(
+            self.identified("12345678901234567", "9007199254740993"), "x.cgxml")
+        self.assertEqual((record["id"], record["ie"]), (12345678901234567, 9007199254740993))
+        self.assertEqual(warnings, [])
+
+    def test_a_whole_number_written_with_a_decimal_zero_is_read(self):
+        [record], _constructii, warnings = reader.parse_bytes(
+            self.identified("10188.0", "50124.00"), "x.cgxml")
+        self.assertEqual((record["id"], record["ie"]), (10188, 50124))
+        self.assertEqual(warnings, [])
+
+    def test_a_number_longer_than_a_layer_field_holds_is_left_empty_and_reported(self):
+        long = "99999999999999999999"
+        [record], _constructii, warnings = reader.parse_bytes(
+            self.identified(long, "-" + long), "x.cgxml")
+        self.assertEqual((record["id"], record["ie"]), (None, None))
+        # the text stays, so the Comparator can pair the files by it
+        self.assertEqual(record["id_text"], long)
+        self.assertEqual(warnings, [f"ID prea lung '{long}'", f"IE prea lung '-{long}'"])
+
+    def test_a_value_that_is_not_a_number_is_left_empty_and_reported(self):
+        data = document(
+            land("<CADSECTOR>12A</CADSECTOR><MEASUREDAREA>1234,56</MEASUREDAREA>"
+                 "<PARCELLEGALAREA>1.234,56</PARCELLEGALAREA>"),
+            building(values="<MEASUREDAREA>55,5</MEASUREDAREA><TOTALAREA>cca 120</TOTALAREA>"
+                            "<LEVELSNO>P+1</LEVELSNO>"))
+        [record], [construction], warnings = reader.parse_bytes(data, "501.cgxml")
+        self.assertEqual((record["sector"], record["sup_mas"], record["sup_acte"]),
+                         (None, None, None))
+        self.assertEqual((construction["sup_mas"], construction["sup_tot"],
+                          construction["etaje"]), (None, None, None))
+        self.assertEqual(warnings, [
+            "sector nenumeric '12A'",
+            "suprafață măsurată nenumerică '1234,56'",
+            "suprafață din acte nenumerică '1.234,56'",
+            "număr de niveluri nenumeric 'P+1'",
+            "suprafață construită la sol nenumerică '55,5'",
+            "suprafață construită desfășurată nenumerică 'cca 120'"])
+
+
+class ManyOutlineTests(unittest.TestCase):
+
+    @staticmethod
+    def squares(count):
+        """Points of count closed 2 m squares, 3 m apart."""
+        rows = []
+        for n in range(count):
+            x, y = 500000 + 3 * (n % 50), 400000 + 3 * (n // 50)
+            rows += points([(x, y), (x + 2, y), (x + 2, y + 2), (x, y + 2), (x, y)],
+                           first=1 + 5 * n)
+        return rows
+
+    def test_outlines_apart_from_each_other_are_not_compared_point_by_point(self):
+        from unittest import mock
+        inside = reader._point_in_ring
+        calls = []
+        with mock.patch.object(reader, "_point_in_ring",
+                               lambda *args: calls.append(1) or inside(*args)):
+            [record], _constructii, warnings = reader.parse_bytes(
+                document(land(), *self.squares(300)), "501.cgxml")
+        self.assertEqual((len(record["rings"]), warnings), (300, []))
+        self.assertEqual(len(calls), 0)
+
+    def test_an_imobil_with_more_outlines_than_are_read_gets_no_geometry(self):
+        from unittest import mock
+        with mock.patch.object(reader, "MAX_RINGS", 5):
+            [within], _constructii, no_warnings = reader.parse_bytes(
+                document(land(), *self.squares(5)), "501.cgxml")
+            [beyond], _constructii, warnings = reader.parse_bytes(
+                document(land(), *self.squares(6)), "501.cgxml")
+        self.assertEqual((len(within["rings"]), no_warnings), (5, []))
+        self.assertEqual((beyond["rings"], beyond["_has_points"]), ([], True))
+        self.assertEqual(warnings, ["imobilul are 6 contururi, peste limita de 5, deci "
+                                    "geometria lui nu a fost construită"])
+
+
+class DeclaredAreaTests(unittest.TestCase):
+    """The area of the outline built from the coordinates against the measured area the file
+    declares."""
+
+    def warnings(self, land_area, building_area="", coordinates=(A, B, C, D)):
+        _imobile, _constructii, warnings = reader.parse_bytes(document(
+            land(f"<MEASUREDAREA>{land_area}</MEASUREDAREA>"),
+            building(values=f"<MEASUREDAREA>{building_area}</MEASUREDAREA>"),
+            *points(coordinates),
+            *points([E, F, G, H], owner="<BUILDINGID>7</BUILDINGID>", first=20)), "501.cgxml")
+        return warnings
+
+    def test_an_outline_with_another_area_than_the_declared_one_is_reported(self):
+        self.assertEqual(self.warnings("150", "9.5"), [
+            "suprafața imobilului calculată din coordonate este 100 mp, iar cea măsurată "
+            "din fișier este 150 mp",
+            "suprafața construcției C1 calculată din coordonate este 4 mp, iar cea "
+            "măsurată din fișier este 9,5 mp"])
+
+    def test_a_declared_area_rounded_to_the_metre_is_the_same_area(self):
+        self.assertEqual(self.warnings("100.4", "4"), [])
+        self.assertEqual(self.warnings("99", "5"), [])
+        # the hole is taken out of the area
+        self.assertEqual(self.warnings("96", "4", (A, B, C, D, A, E, F, G, H, E)), [])
+        self.assertEqual(len(self.warnings("100", "4", (A, B, C, D, A, E, F, G, H, E))), 1)
+
+    def test_an_area_that_is_not_declared_is_not_compared(self):
+        for area in ("", "0", "0.0"):
+            with self.subTest(area=area):
+                self.assertEqual(self.warnings(area, area), [])
+
+    def test_a_record_without_geometry_is_not_compared(self):
+        [_record], _constructii, warnings = reader.parse_bytes(
+            document(land("<MEASUREDAREA>100</MEASUREDAREA>")), "501.cgxml")
+        self.assertEqual(warnings, [])
 
 
 if __name__ == "__main__":

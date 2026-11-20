@@ -8,10 +8,12 @@ import sys
 from qgis.PyQt.QtGui import QColor, QFont, QFontDatabase  # type: ignore
 from qgis.core import (  # type: ignore
     Qgis, QgsCategorizedSymbolRenderer, QgsFillSymbol, QgsMapLayer, QgsMarkerSymbol,
-    QgsPalLayerSettings,
+    QgsPalLayerSettings, QgsProject,
     QgsRendererCategory, QgsSingleSymbolRenderer, QgsTextBufferSettings, QgsTextFormat,
     QgsVectorLayerSimpleLabeling,
 )
+
+from . import roles
 
 # outline of the Conversie CGXML layers, also the color of their DXF layers; chosen to stay
 # visible over orthophotos (vegetation, tiled roofs, forest, asphalt) and on a white canvas
@@ -126,6 +128,19 @@ def store_with_file(layer):
         save("CADex", "", True, "", categories)
     elif path.endswith(".shp"):
         layer.saveDefaultStyle(categories)
+
+
+def restore_from_file(layer):
+    """Read the style saved with the layer's file, the CADex custom properties included, into
+    a layer opened without it. Processing loads a layer named by its file path, such as the
+    output of an earlier step in a model, without its style, so a converted layer would lack
+    its CADex column roles. A layer in the project, and one that already has CADex
+    properties, is left as it is. Main thread."""
+    if layer.providerType() != "ogr" or QgsProject.instance().mapLayer(layer.id()) is not None:
+        return
+    if any(key.startswith(roles.PROPERTY_PREFIX) for key in layer.customPropertyKeys()):
+        return
+    layer.loadDefaultStyle()
 
 
 def style_categories(layer, field: str, categories):

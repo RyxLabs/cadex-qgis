@@ -160,4 +160,14 @@ def dialog_stylesheet(t: Tokens) -> str:
             color: {ON_ACCENT};
             border-color: {t.fill_disabled};
         }}
+        /* keyboard focus: a border one pixel wider, the padding one pixel narrower, so the
+           segment keeps its size */
+        QToolButton#cadexSegment:focus {{
+            border: 2px solid {t.text};
+            padding: 3px 15px;
+        }}
+        QToolButton#cadexSegment[position="middle"]:focus,
+        QToolButton#cadexSegment[position="last"]:focus {{
+            padding-left: 14px;
+        }}
     """

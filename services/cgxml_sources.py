@@ -3,15 +3,28 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """CGXML sources (.cgxml files, ZIP archives, folders) and reading them file by file."""
 
+import errno
 import os
 import re
 import zipfile
 import zlib
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 from . import cgxml_reader
 
 EXTENSION = ".cgxml"
 _QUOTED = re.compile(r'"([^"]+)"')
+
+# read_each() reads up to READ_AHEAD files of a folder ahead of the one it parses, on READERS
+# threads: opening a file for the first time waits several milliseconds for the antivirus
+# scan, longer than parsing it takes. A file over READ_AHEAD_BYTES is read when its turn
+# comes.
+READ_AHEAD = 32
+READERS = 8
+READ_AHEAD_BYTES = 4 * 1024 * 1024
+# a ZIP member is inflated this much at a time
+_PIECE = 1024 * 1024
 
 
 def split_paths(text) -> list:
@@ -49,9 +62,10 @@ def is_source(path) -> bool:
 
 
 class Unreadable(tuple):
-    """A list_sources() entry for a ZIP archive or folder that cannot be listed, shaped like
-    the others: (display name, path, None). problem is the Romanian reason read_each() gives
-    for it, error the exception."""
+    """A list_sources() entry for a chosen path that gives no files: a ZIP archive or folder
+    that cannot be listed, a path that does not exist, a file of another kind. It is shaped
+    like the others, (display name, path, None). problem is the Romanian reason read_each()
+    gives for it, error the exception, if any."""
 
     def __new__(cls, display, path, problem, error=None):
         entry = super().__new__(cls, (display, path, None))
@@ -63,6 +77,8 @@ class Unreadable(tuple):
 DAMAGED_ARCHIVE = "arhiva ZIP este deteriorată sau incompletă"
 ARCHIVE_IN_USE = ("arhiva ZIP nu poate fi deschisă: este folosită de alt program sau nu aveți "
                   "drept de acces la ea")
+MISSING_PATH = "calea nu a fost găsită"
+NOT_A_SOURCE = "nu este un folder, o arhivă ZIP sau un fișier .cgxml"
 
 
 def unreadable_text(sources) -> str:
@@ -96,15 +112,21 @@ def _open_problem(error, kind) -> str:
                         or error.__class__.__name__)
 
 
-def list_sources(paths, recursive=True):
+def _never():
+    return False
+
+
+def list_sources(paths, recursive=True, stop=_never):
     """[(display name, path, zip member or None)] of every .cgxml in the sources, sorted.
 
     paths is a path or a list of them. With several roots the display name starts with the
-    root's name, so equal file names in two folders stay apart. Other files and missing
-    paths are skipped. A damaged or locked archive and a chosen folder that cannot be listed
-    are one Unreadable entry each, so the other sources are still read. A subfolder that
-    cannot be listed is skipped: every NTFS drive holds System Volume Information and every
-    Documents folder the hidden My Music link, and a user's account may list neither.
+    root's name, so equal file names in two folders stay apart. The other files of a folder
+    are skipped. A chosen path that does not exist, a chosen file of another kind, a damaged
+    or locked archive and a chosen folder that cannot be listed are one Unreadable entry
+    each, so the other sources are still read. A subfolder that cannot be listed is skipped:
+    every NTFS drive holds System Volume Information and every Documents folder the hidden
+    My Music link, and a user's account may list neither. When stop() turns true the listing
+    ends with what it has found.
     """
     roots = _as_list(paths)
     prefix = len(roots) > 1
@@ -124,6 +146,8 @@ def list_sources(paths, recursive=True):
             sources.append(Unreadable(display, path, problem, error))
 
     for root in roots:
+        if stop():
+            break
         label = os.path.basename(root.rstrip("/\\")) or root
         if os.path.isfile(root) and root.lower().endswith(".zip"):
             try:
@@ -155,6 +179,8 @@ def list_sources(paths, recursive=True):
             if recursive:
                 walked = []
                 for folder, dirs, files in os.walk(root, onerror=refused):
+                    if stop():
+                        break
                     dirs.sort()
                     walked.extend(os.path.join(folder, name) for name in files
                                   if name.lower().endswith(EXTENSION)
@@ -173,6 +199,13 @@ def list_sources(paths, recursive=True):
             for full in walked:
                 relative = os.path.relpath(full, root)
                 add(os.path.join(label, relative) if prefix else relative, full, None)
+        elif os.path.exists(root):
+            unreadable(label, root, NOT_A_SOURCE, None)
+        else:
+            kind = next((k for k, ending in (("zip", ".zip"), ("file", EXTENSION))
+                         if root.lower().endswith(ending)), None)
+            unreadable(label, root, _OPEN_PROBLEMS[kind][0] if kind else MISSING_PATH,
+                       FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), root))
     sources.sort(key=lambda s: cgxml_reader._natural_key(s[0]))
     return sources
 
@@ -195,32 +228,70 @@ def read_source(source, archives):
     if archive is None:
         archive = zipfile.ZipFile(path)
         archives[path] = archive
-    info = archive.getinfo(member)
-    # checked before decompressing; zipfile never inflates past the declared size
+    return cgxml_reader.parse_bytes(_member_bytes(archive, archive.getinfo(member)), display)
+
+
+def _member_bytes(archive, info) -> bytes:
+    """The content of a ZIP member, read _PIECE bytes at a time: ZipFile.read() inflates a
+    member whose header understates its size in full, up to 2 GB, before it cuts the content
+    to the declared size."""
     if info.file_size > cgxml_reader.MAX_FILE_BYTES:
         raise cgxml_reader.CgxmlError(
             f"fișier prea mare ({info.file_size // (1024 * 1024)} MB)")
-    return cgxml_reader.parse_bytes(archive.read(member), display)
+    pieces = []
+    with archive.open(info) as member:
+        piece = member.read(_PIECE)
+        while piece:
+            pieces.append(piece)
+            piece = member.read(_PIECE)
+    return b"".join(pieces)
 
 
-def _never():
-    return False
+def _file_bytes(path):
+    """The content of a file read ahead, None for one over READ_AHEAD_BYTES. Runs on a reader
+    thread."""
+    if os.path.getsize(path) > READ_AHEAD_BYTES:
+        return None
+    with open(path, "rb") as fp:
+        return fp.read()
 
 
 def read_each(sources, stop=_never, progress=None):
-    """Yield (source, parsed or None, problem or None) for each source.
+    """Yield (source, parsed or None, problem or None) for each source, in their order.
 
     An unreadable file yields its reason and the others are still read. progress receives
-    0 to 1.
+    0 to 1. The files of a folder are read by a few threads ahead of the one being parsed,
+    which is parsed on the caller's thread.
     """
     archives = {}
     total = max(len(sources), 1)
+    readers = ThreadPoolExecutor(READERS, thread_name_prefix="CADex CGXML")
+    following = iter(sources)
+    # (source, the future of its content or None for a source read when its turn comes)
+    ahead = deque()
+
+    def read_ahead():
+        while len(ahead) < READ_AHEAD:
+            source = next(following, None)
+            if source is None:
+                return
+            plain = not isinstance(source, Unreadable) and source[2] is None
+            ahead.append((source, readers.submit(_file_bytes, source[1]) if plain else None))
+
     try:
-        for n, source in enumerate(sources):
+        done = 0
+        read_ahead()
+        while ahead:
             if stop():
                 return
+            source, content = ahead.popleft()
+            read_ahead()
             try:
-                result = read_source(source, archives)
+                data = content.result() if content is not None else None
+                if data is None:
+                    result = read_source(source, archives)
+                else:
+                    result = cgxml_reader.parse_bytes(data, source[0])
             except cgxml_reader.CgxmlError as e:
                 yield source, None, str(e)
             except (zipfile.BadZipFile, zlib.error):
@@ -235,8 +306,13 @@ def read_each(sources, stop=_never, progress=None):
                 yield source, None, f"nu s-a putut citi ({e})"
             else:
                 yield source, result, None
+            done += 1
             if progress is not None:
-                progress((n + 1) / total)
+                progress(done / total)
     finally:
+        for _source, content in ahead:
+            if content is not None:
+                content.cancel()
+        readers.shutdown(wait=True)
         for archive in archives.values():
             archive.close()

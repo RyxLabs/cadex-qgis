@@ -8,3 +8,6 @@
 *.json text
 *.yml text
 *.db binary
+# the reader's fixtures are read byte for byte: a line ending changed on checkout would make
+# a different test input on Windows than in CI
+*.cgxml -text

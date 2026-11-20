@@ -5,7 +5,6 @@
 
 import configparser
 import os
-import sys
 import tempfile
 import unittest
 
@@ -14,44 +13,30 @@ import synthetic
 from synthetic import Building, Land
 
 helpers.start_qgis(gui=False)
+PROVIDER = helpers.start_processing()
 
 from qgis.core import (  # noqa: E402  # type: ignore
     QgsApplication, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry,
     QgsProcessingContext, QgsProcessingException, QgsProcessingFeedback, QgsProject,
 )
-
-# QGIS's own Processing plugin, next to the other bundled Python plugins
-sys.path.append(os.path.join(QgsApplication.pkgDataPath(), "python", "plugins"))
-from processing.core.Processing import Processing  # noqa: E402  # type: ignore
 import processing  # noqa: E402  # type: ignore
 
 from cadex.processing_provider import provider as provider_module  # noqa: E402
 from cadex.services import building_topology_service as bts  # noqa: E402
 from cadex.services import cgxml_compare, intravilan_service, roles, xlsx  # noqa: E402
 
-# the algorithms refuse a layer whose coordinates look like degrees or lie outside Romania,
-# so the hand-built layers are drawn from a point in Romania
-ORIGIN = (450000, 350000)
-
-
-def square(x, y, size):
-    return helpers.square(ORIGIN[0] + x, ORIGIN[1] + y, size)
+square = helpers.square_in_romania
 
 
 def moved(wkt):
-    """wkt drawn from the same point in Romania as square()."""
+    """wkt drawn from helpers.ORIGIN, as square() is."""
     geometry = QgsGeometry.fromWkt(wkt)
-    geometry.translate(*ORIGIN)
+    geometry.translate(*helpers.ORIGIN)
     return geometry.asWkt()
 
 
-Processing.initialize()
-PROVIDER = provider_module.CadexProvider()
-QgsApplication.processingRegistry().addProvider(PROVIDER)
-
-
 def run(name, parameters, feedback=None):
-    return processing.run(f"cadex:{name}", parameters, feedback=feedback or QgsProcessingFeedback())
+    return processing.run(f"cadex:{name}", parameters, feedback=feedback or helpers.feedback())
 
 
 def metadata_version():
@@ -134,17 +119,12 @@ class ToolTests(unittest.TestCase):
         spike = [(500000, 400000), (500020, 400000), (500020, 400010), (500010, 399995),
                  (500000, 400010)]
         synthetic.write(folder, "1307.cgxml", Land(rings=[spike], cadgenno="1307"))
-        warnings = []
-
-        class Feedback(QgsProcessingFeedback):
-            def pushWarning(self, message):
-                warnings.append(message)
-
+        feedback = helpers.feedback()
         result = run("cgxmlconvert", {"INPUT": [folder], "OUTPUT_IMOBILE": "TEMPORARY_OUTPUT"},
-                     Feedback())
+                     feedback)
         self.assertEqual(result["OUTPUT_IMOBILE"].featureCount(), 1)
-        self.assertEqual(warnings, ["1307.cgxml: geometrie invalidă în layerul Imobile, "
-                                    "păstrată așa cum este în fișier"])
+        self.assertEqual(feedback.warnings, ["1307.cgxml: geometrie invalidă în layerul Imobile, "
+                                             "păstrată așa cum este în fișier"])
 
     def test_nothing_to_convert_is_an_error(self):
         empty = os.path.join(self.tmp, "gol")
@@ -226,6 +206,10 @@ class ToolTests(unittest.TestCase):
                                       fields="propr:string")
         with self.assertRaises(QgsProcessingException) as raised:
             run("comparelayers", {"OLD": no_id, "NEW": new})
+        self.assertIn("Alegeți coloana cheie: în layerul 'fara id' nu s-a găsit după nume "
+                      "coloana cu ID-ul sau IE-ul imobilului.", str(raised.exception))
+        with self.assertRaises(QgsProcessingException) as raised:
+            run("comparelayers", {"OLD": no_id, "OLD_KEY": "id", "NEW": new, "NEW_KEY": "id"})
         self.assertIn("'fara id' nu are coloana 'id'", str(raised.exception))
 
     def test_two_converted_deliveries_compare_as_their_files_do(self):
@@ -252,29 +236,22 @@ class ToolTests(unittest.TestCase):
         layers = []
         # an eTerra export has no cadastral sector
         for name, row in (("eterra", [7339, 50124, None]), ("livrare", [501, 50124, 3])):
-            layer = helpers.polygon_layer(name, [(square(0, 0, 10), row)],
-                                          fields="id:integer,ie:integer,sector:integer")
-            roles.mark_columns(layer, [("id", "id"), ("ie", "ie"), ("sector", "sector")])
-            roles.mark_batch(layer, "20260101")
-            layers.append(layer)
-        warnings = []
-
-        class Feedback(QgsProcessingFeedback):
-            def pushWarning(self, message):
-                warnings.append(message)
-
+            layers.append(helpers.converted_layer(name, "20260101",
+                                                  "id:integer,ie:integer,sector:integer",
+                                                  [(square(0, 0, 10), row)]))
+        feedback = helpers.feedback()
         run("comparelayers", {"OLD": layers[0], "NEW": layers[1], "OLD_KEY": "ie",
-                              "NEW_KEY": "ie"}, Feedback())
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("'eterra' este un export eTerra convertit", warnings[0])
-        self.assertIn("comparați fișierele CGXML, potrivite după IE", warnings[0])
+                              "NEW_KEY": "ie"}, feedback)
+        self.assertEqual(len(feedback.warnings), 1)
+        self.assertIn("'eterra' este un export eTerra convertit", feedback.warnings[0])
+        self.assertIn("comparați fișierele CGXML, potrivite după IE", feedback.warnings[0])
         # left at 'id', the key of two conversions is the one the window takes: the IE
-        result = run("comparelayers", {"OLD": layers[0], "NEW": layers[1]}, Feedback())
+        result = run("comparelayers", {"OLD": layers[0], "NEW": layers[1]})
         self.assertEqual((result["ADDED"], result["DELETED"]), (0, 0))
         # two deliveries get no warning
-        warnings.clear()
-        run("comparelayers", {"OLD": layers[1], "NEW": layers[1]}, Feedback())
-        self.assertEqual(warnings, [])
+        feedback = helpers.feedback()
+        run("comparelayers", {"OLD": layers[1], "NEW": layers[1]}, feedback)
+        self.assertEqual(feedback.warnings, [])
 
         # construcții pair by the IE of their imobil, since the IDs differ
         buildings = {}
@@ -282,19 +259,16 @@ class ToolTests(unittest.TestCase):
                 ("c eterra", [7339, "C1", 50124], "id:integer,nr_constr:string,ie_imobil:integer"),
                 ("c livrare", [501, "C1", 50124], "id:integer,nr_constr:string,ie_imobil:integer"),
                 ("c fara ie", [7339, "C1"], "id:integer,nr_constr:string")):
-            layer = helpers.polygon_layer(name, [(square(2, 2, 5), row)], fields=columns)
-            roles.mark_columns(layer, [(c.split(":")[0], c.split(":")[0])
-                                       for c in columns.split(",")])
-            roles.mark_batch(layer, "20260101")
-            buildings[name] = layer
+            buildings[name] = helpers.converted_layer(name, "20260101", columns,
+                                                      [(square(2, 2, 5), row)])
         parameters = {"OLD": layers[0], "NEW": layers[1], "OLD_KEY": "ie", "NEW_KEY": "ie",
                       "OLD_BUILDINGS": buildings["c eterra"],
                       "NEW_BUILDINGS": buildings["c livrare"]}
-        result = run("comparelayers", parameters, Feedback())
+        result = run("comparelayers", parameters)
         self.assertEqual((result["BUILDINGS_UNCHANGED"], result["BUILDINGS_ADDED"],
                           result["BUILDINGS_DELETED"]), (1, 0, 0))
         with self.assertRaises(QgsProcessingException) as raised:
-            run("comparelayers", dict(parameters, OLD_BUILDINGS=buildings["c fara ie"]), Feedback())
+            run("comparelayers", dict(parameters, OLD_BUILDINGS=buildings["c fara ie"]))
         self.assertIn("IE-ul imobilului", str(raised.exception))
 
     def test_layer_comparison_with_buildings(self):
@@ -421,15 +395,11 @@ class ToolTests(unittest.TestCase):
                                                     style="eterra"))
         synthetic.write(livrare, "503.cgxml", Land(rings=[square_ring(0)], cadgenno="503",
                                                    ie="70002", sector="3"))
-        warnings = []
-
-        class Feedback(QgsProcessingFeedback):
-            def pushWarning(self, message):
-                warnings.append(message)
-
+        feedback = helpers.feedback()
         run("comparecgxml", {"OLD": [eterra], "NEW": [livrare],
-                             "MODE": cgxml_compare.MODES.index(cgxml_compare.IE)}, Feedback())
-        self.assertTrue(any("nu are coordonate" in w for w in warnings), warnings)
+                             "MODE": cgxml_compare.MODES.index(cgxml_compare.IE)}, feedback)
+        self.assertTrue(any("nu are coordonate" in w for w in feedback.warnings),
+                        feedback.warnings)
 
     def test_compare_geopackages_after_a_removal(self):
         # the second version drops the first imobil, so every fid after it shifts by one
@@ -705,31 +675,21 @@ class ProcessingBaseTests(unittest.TestCase):
     def test_a_report_that_was_not_written_is_an_error_and_not_an_output(self):
         from cadex.processing_provider.base import CadexAlgorithm
         from cadex.services.tasks import CadexTask
-        errors = []
-
-        class Feedback(QgsProcessingFeedback):
-            def reportError(self, error, fatalError=False):
-                errors.append((error, fatalError))
-
+        feedback = helpers.feedback()
         task = CadexTask("CADex: test")
         task.excel_path = os.path.join(self.tmp, "raport.xlsx")
         results = {}
-        CadexAlgorithm.report_output(task, results, "OUTPUT_XLSX", Feedback())
+        CadexAlgorithm.report_output(task, results, "OUTPUT_XLSX", feedback)
         self.assertEqual(results, {"OUTPUT_XLSX": task.excel_path})
         task.report_error = "Fișierul 'raport.xlsx' nu poate fi scris."
         results = {}
-        CadexAlgorithm.report_output(task, results, "OUTPUT_XLSX", Feedback())
+        CadexAlgorithm.report_output(task, results, "OUTPUT_XLSX", feedback)
         self.assertEqual(results, {})
         # the run goes on: its layers are written
-        self.assertEqual(errors, [("Fișierul 'raport.xlsx' nu poate fi scris.", False)])
+        self.assertEqual(feedback.errors, [("Fișierul 'raport.xlsx' nu poate fi scris.", False)])
 
     def test_features_a_sink_refuses_are_counted_in_a_warning(self):
         from cadex.processing_provider.base import CadexAlgorithm
-        warnings = []
-
-        class Feedback(QgsProcessingFeedback):
-            def pushWarning(self, message):
-                warnings.append(message)
 
         class Sink:
             def __init__(self):
@@ -742,9 +702,10 @@ class ProcessingBaseTests(unittest.TestCase):
             def lastError(self):
                 return "String of length 28 exceeds maximum field length (10)"
 
-        self.assertEqual(CadexAlgorithm.write(Sink(), ["a", "b", "c"], Feedback()), 1)
-        self.assertEqual(warnings, ["2 elemente din 3 nu au putut fi scrise în rezultat. "
-                                    "String of length 28 exceeds maximum field length (10)"])
+        feedback = helpers.feedback()
+        self.assertEqual(CadexAlgorithm.write(Sink(), ["a", "b", "c"], feedback), 1)
+        self.assertEqual(feedback.warnings, ["2 elemente din 3 nu au putut fi scrise în rezultat. "
+                                             "String of length 28 exceeds maximum field length (10)"])
 
     def test_the_help_panel_shows_an_algorithms_own_text_when_there_is_one(self):
         from unittest import mock
@@ -826,25 +787,11 @@ class TopologyProcessingTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="cadex_proc_topo_")
-        self.messages = []
+        self.said = helpers.feedback()
 
     def tearDown(self):
         QgsProject.instance().clear()
         helpers.remove_folder(self.tmp)
-
-    def feedback(self):
-        messages = self.messages
-
-        class Feedback(QgsProcessingFeedback):
-            def pushWarning(self, message):
-                messages.append(("warning", message))
-
-            def reportError(self, message, fatalError=False):
-                messages.append(("error", message))
-        return Feedback()
-
-    def warnings(self):
-        return [text for kind, text in self.messages if kind == "warning"]
 
     def layers(self, converted=True):
         """Imobile 1 and 2 in sector 5 under a road of sector 0 that reaches 10 cm into
@@ -865,7 +812,7 @@ class TopologyProcessingTests(unittest.TestCase):
     def check(self, parameters):
         return run("topologycheck", dict({"OUTPUT_AREAS": "TEMPORARY_OUTPUT",
                                           "OUTPUT_POINTS": "TEMPORARY_OUTPUT"}, **parameters),
-                   self.feedback())
+                   self.said)
 
     @staticmethod
     def rows(result):
@@ -880,18 +827,18 @@ class TopologyProcessingTests(unittest.TestCase):
             ("Construcție pe alt imobil", "Eroare", "construcție 1 C1"),
             ("Suprapunere între imobile", "Avertisment", "imobil 1"),
             ("Suprapunere între imobile", "Avertisment", "imobil 2")])
-        self.assertEqual(self.warnings(), [])
+        self.assertEqual(self.said.warnings, [])
 
     def test_converted_layers_are_cut_as_in_the_window(self):
         imobile, constructii = self.layers()
         result = run("buildingtopology", {"IMOBILE": imobile, "CONSTRUCTII": constructii,
-                                          "OUTPUT": "TEMPORARY_OUTPUT"}, self.feedback())
+                                          "OUTPUT": "TEMPORARY_OUTPUT"}, self.said)
         self.assertEqual([f["stare"] for f in result["OUTPUT"].getFeatures()], [bts.ELSEWHERE])
         # a plain imobile layer gives the building no imobil to link to: it is cut where it
         # stands
         plain, _constructii = self.layers(converted=False)
         result = run("buildingtopology", {"IMOBILE": plain, "CONSTRUCTII": constructii,
-                                          "OUTPUT": "TEMPORARY_OUTPUT"}, self.feedback())
+                                          "OUTPUT": "TEMPORARY_OUTPUT"}, self.said)
         self.assertEqual([f["stare"] for f in result["OUTPUT"].getFeatures()], [bts.LOSS])
 
     def test_a_building_link_without_the_imobil_column_is_refused(self):
@@ -938,12 +885,12 @@ class TopologyProcessingTests(unittest.TestCase):
     def test_the_roads_sector_without_a_sector_column_is_a_warning(self):
         imobile, _constructii = self.layers(converted=False)
         self.check({"IMOBILE": imobile, "ID_FIELD": "id"})
-        self.assertEqual(len(self.warnings()), 1)
-        self.assertIn("'Sector cadastral'", self.warnings()[0])
-        self.messages.clear()
+        self.assertEqual(len(self.said.warnings), 1)
+        self.assertIn("'Sector cadastral'", self.said.warnings[0])
+        self.said.warnings.clear()
         self.check({"IMOBILE": imobile, "ID_FIELD": "id", "SECTOR_FIELD": "sector"})
         self.check({"IMOBILE": imobile, "ID_FIELD": "id", "ROADS_SECTOR": ""})
-        self.assertEqual(self.warnings(), [])
+        self.assertEqual(self.said.warnings, [])
 
     def test_a_snapping_tolerance_not_below_the_snapping_distance_is_refused(self):
         imobile, _constructii = self.layers()
@@ -955,8 +902,8 @@ class TopologyProcessingTests(unittest.TestCase):
         # bom_30003 has no coordinates
         run("topologycheckcgxml", {"INPUT": [helpers.DATA_DIR], "RECURSIVE": False,
                                    "OUTPUT_AREAS": "TEMPORARY_OUTPUT",
-                                   "OUTPUT_POINTS": "TEMPORARY_OUTPUT"}, self.feedback())
-        self.assertEqual(self.warnings(),
+                                   "OUTPUT_POINTS": "TEMPORARY_OUTPUT"}, self.said)
+        self.assertEqual(self.said.warnings,
                          ["1 înregistrare fără coordonate nu a fost verificată."])
 
     def test_the_report_names_the_tolerances_it_was_made_with(self):
@@ -965,8 +912,7 @@ class TopologyProcessingTests(unittest.TestCase):
         result = self.check({"IMOBILE": imobile, "CONSTRUCTII": constructii,
                              "SNAP_DISTANCE": 0.3, "OUTPUT_XLSX": report})
         self.assertEqual(result["OUTPUT_XLSX"], report)
-        _names, rows = xlsx.read_rows(report, "Sumar")
-        facts = {row[0]: row[1] for row in rows if len(row) > 1}
+        facts = helpers.summary_facts(report)
         self.assertEqual(facts["Layer de imobile"], "Imobile livrare")
         self.assertEqual(facts["Layer de construcții"], "Construcții livrare")
         self.assertEqual(facts["Distanță de racordare"], "0,3 m")
@@ -980,8 +926,8 @@ class TopologyProcessingTests(unittest.TestCase):
         result = self.check({"IMOBILE": imobile, "OUTPUT_XLSX": report})
         self.assertNotIn("OUTPUT_XLSX", result)
         self.assertEqual(result["OUTPUT_AREAS"].featureCount(), 2)
-        self.assertEqual(len([m for m in self.messages if m[0] == "error"]), 1)
-        self.assertIn("Fișierul 'raport.xlsx' nu poate fi scris", self.messages[-1][1])
+        [(error, _fatal)] = self.said.errors
+        self.assertIn("Fișierul 'raport.xlsx' nu poate fi scris", error)
 
     def test_the_same_imobil_in_two_files_is_a_warning_not_an_overlap(self):
         folder = os.path.join(self.tmp, "livrare")
@@ -990,18 +936,18 @@ class TopologyProcessingTests(unittest.TestCase):
                                                    cadgenno="501", sector="3"))
         result = run("topologycheckcgxml", {"INPUT": [folder],
                                             "OUTPUT_AREAS": "TEMPORARY_OUTPUT",
-                                            "OUTPUT_POINTS": "TEMPORARY_OUTPUT"}, self.feedback())
+                                            "OUTPUT_POINTS": "TEMPORARY_OUTPUT"}, self.said)
         self.assertEqual(result["PROBLEMS"], 0)
-        self.assertEqual(len(self.warnings()), 1)
-        self.assertIn("501", self.warnings()[0])
-        self.assertIn("mai multe fișiere", self.warnings()[0])
+        self.assertEqual(len(self.said.warnings), 1)
+        self.assertIn("501", self.said.warnings[0])
+        self.assertIn("mai multe fișiere", self.said.warnings[0])
 
     def test_an_outline_sector_no_imobil_carries_is_a_warning(self):
         imobile, _constructii = self.layers()
         limits = helpers.polygon_layer("Sectoare", [(square(0, 0, 40), ["S5"])],
                                        fields="nr:string")
         self.check({"IMOBILE": imobile, "LIMITS": limits, "LIMIT_FIELD": "nr"})
-        self.assertEqual(self.warnings(), ["Sectorul S5 din limite nu apare la niciun imobil."])
+        self.assertEqual(self.said.warnings, ["Sectorul S5 din limite nu apare la niciun imobil."])
 
     def test_a_finding_the_output_cannot_hold_is_a_warning(self):
         from unittest import mock
@@ -1019,8 +965,8 @@ class TopologyProcessingTests(unittest.TestCase):
         imobile, _constructii = self.layers()
         with mock.patch.object(tcs, "findings_features", with_a_line):
             self.check({"IMOBILE": imobile})
-        self.assertEqual(len(self.warnings()), 1)
-        self.assertIn("1 element din 1 nu a putut fi scris în rezultat.", self.warnings()[0])
+        self.assertEqual(len(self.said.warnings), 1)
+        self.assertIn("1 element din 1 nu a putut fi scris în rezultat.", self.said.warnings[0])
 
 
 class AnalysisAlgorithmTests(unittest.TestCase):
@@ -1063,18 +1009,14 @@ class AnalysisAlgorithmTests(unittest.TestCase):
     def test_a_total_row_under_the_parcels_is_left_out(self):
         table = self.csv("nr,proprietar,suprafata_act\n1,A,10000\n2,B,20000\n3,C,15000\n"
                          "TOTAL,,45000\n")
-        warnings = []
-
-        class Feedback(QgsProcessingFeedback):
-            def pushWarning(self, message):
-                warnings.append(message)
-
+        feedback = helpers.feedback()
         result = run("areareduction", {"TABLE": table, "AREA_FIELD": "suprafata_act",
                                        "CONTOUR_AREA": 43200, "OUTPUT": "TEMPORARY_OUTPUT"},
-                     Feedback())
+                     feedback)
         areas = {f["nr"]: f["sup_diminuata"] for f in result["OUTPUT"].getFeatures()}
         self.assertEqual([areas[nr] for nr in ("1", "2", "3")], [9600, 19200, 14400])
-        self.assertTrue(any("rând de total" in message for message in warnings), warnings)
+        self.assertTrue(any("rând de total" in message for message in feedback.warnings),
+                        feedback.warnings)
 
     def test_a_row_number_is_refused_where_a_column_of_data_is_wanted(self):
         imobile = helpers.gpkg_layer(helpers.polygon_layer(
@@ -1098,12 +1040,6 @@ class AnalysisAlgorithmTests(unittest.TestCase):
                           str(raised.exception), field)
 
     def test_a_report_that_cannot_be_written_is_an_error_and_the_layer_stays(self):
-        errors = []
-
-        class Feedback(QgsProcessingFeedback):
-            def reportError(self, error, fatalError=False):
-                errors.append(error)
-
         # nobody can open a folder for writing, just as nobody can write a workbook open in
         # Excel
         excel = os.path.join(self.tmp, "raport.xlsx")
@@ -1114,14 +1050,14 @@ class AnalysisAlgorithmTests(unittest.TestCase):
                 ("areareduction", {"TABLE": self.csv("nr,suprafata_act\n1,4000\n2,6000\n"),
                                    "AREA_FIELD": "suprafata_act", "CONTOUR_AREA": 9000}))
         for name, parameters in runs:
-            errors.clear()
+            feedback = helpers.feedback()
             result = run(name, dict(parameters, OUTPUT="TEMPORARY_OUTPUT", OUTPUT_XLSX=excel),
-                         Feedback())
+                         feedback)
             self.assertGreater(result["OUTPUT"].featureCount(), 0, name)
             self.assertNotIn("OUTPUT_XLSX", result, name)
-            self.assertEqual(len(errors), 1, name)
-            self.assertTrue(errors[0].startswith("Fișierul 'raport.xlsx' nu poate fi scris"),
-                            errors[0])
+            self.assertEqual(len(feedback.errors), 1, name)
+            [(error, _fatal)] = feedback.errors
+            self.assertTrue(error.startswith("Fișierul 'raport.xlsx' nu poate fi scris"), error)
 
     def test_every_imobil_reaches_the_output_whatever_its_repaired_geometry(self):
         spike = moved("POLYGON((0 0, 10 0, 10 10, 5 10, 5 20, 5 10, 0 10, 0 0))")
@@ -1142,8 +1078,7 @@ class AnalysisAlgorithmTests(unittest.TestCase):
         excel = os.path.join(self.tmp, "diminuare.xlsx")
         run("areareduction", {"TABLE": table, "AREA_FIELD": "suprafata_act", "CONTOUR": contour,
                               "OUTPUT": "TEMPORARY_OUTPUT", "OUTPUT_XLSX": excel})
-        _names, rows = xlsx.read_rows(excel, "Sumar")
-        facts = {row[0]: row[1] for row in rows if row and row[0]}
+        facts = helpers.summary_facts(excel)
         self.assertEqual(facts["Tabel"], "Parcele tarla 12")
         self.assertEqual(facts["Contur"], "Contur tarla 12, tot layerul (1 element)")
 
@@ -1188,19 +1123,14 @@ class AnalysisAlgorithmTests(unittest.TestCase):
         self.assertAlmostEqual(result["FACTOR"], area / 10000)
 
     def test_a_negative_area_is_named_as_such(self):
-        warnings = []
-
-        class Feedback(QgsProcessingFeedback):
-            def pushWarning(self, message):
-                warnings.append(message)
-
+        feedback = helpers.feedback()
         result = run("areareduction", {
             "TABLE": self.csv("nr,suprafata_act\n1,-100\n2,6000\n3,4000\n"),
             "AREA_FIELD": "suprafata_act", "CONTOUR_AREA": 9000, "OUTPUT": "TEMPORARY_OUTPUT"},
-            Feedback())
+            feedback)
         self.assertAlmostEqual(result["FACTOR"], 0.9)
-        about_areas = [m for m in warnings if "suprafa" in m]
-        self.assertEqual(len(about_areas), 1, warnings)
+        about_areas = [m for m in feedback.warnings if "suprafa" in m]
+        self.assertEqual(len(about_areas), 1, feedback.warnings)
         self.assertIn("are suprafața negativă și rămâne neschimbat", about_areas[0])
 
     def test_rows_hidden_in_excel_are_left_out_as_in_the_window(self):
@@ -1221,38 +1151,20 @@ class AnalysisAlgorithmTests(unittest.TestCase):
         with zipfile.ZipFile(path, "w") as zf:
             for name, data in parts.items():
                 zf.writestr(name, data)
-        warnings = []
-
-        class Feedback(QgsProcessingFeedback):
-            def pushWarning(self, message):
-                warnings.append(message)
-
+        feedback = helpers.feedback()
         excel = os.path.join(self.tmp, "diminuare.xlsx")
         result = run("areareduction", {"TABLE": path, "AREA_FIELD": "suprafata_act",
                                        "CONTOUR_AREA": 3600, "OUTPUT": "TEMPORARY_OUTPUT",
-                                       "OUTPUT_XLSX": excel}, Feedback())
+                                       "OUTPUT_XLSX": excel}, feedback)
         self.assertEqual({f["nr"]: f["sup_diminuata"] for f in result["OUTPUT"].getFeatures()},
                          {1: 900, 3: 2700})
-        self.assertIn("1 rând ascuns în Excel a fost lăsat deoparte: 3.", warnings)
-        _names, rows = xlsx.read_rows(excel, "Sumar")
-        facts = {row[0]: row[1] for row in rows if row and row[0]}
-        self.assertEqual(facts["Rânduri ascunse în Excel, lăsate deoparte"], "1 rând: 3")
+        self.assertIn("1 rând ascuns în Excel a fost lăsat deoparte: 3.", feedback.warnings)
+        self.assertEqual(helpers.summary_facts(excel)["Rânduri ascunse în Excel, lăsate deoparte"],
+                         "1 rând: 3")
 
 
 class CompareProcessingTests(unittest.TestCase):
     """The two Comparator algorithms."""
-
-    class Feedback(QgsProcessingFeedback):
-        def __init__(self):
-            super().__init__()
-            self.warnings = []
-            self.errors = []
-
-        def pushWarning(self, message):
-            self.warnings.append(message)
-
-        def reportError(self, error, fatalError=False):
-            self.errors.append((error, fatalError))
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="cadex_cmp_proc_")
@@ -1282,7 +1194,7 @@ class CompareProcessingTests(unittest.TestCase):
     def test_a_report_that_cannot_be_written_keeps_the_comparison(self):
         self.deliveries()
         report = os.path.join(self.tmp, "lipsa", "raport.xlsx")
-        feedback = self.Feedback()
+        feedback = helpers.feedback()
         result = run("comparecgxml", {"OLD": [self.old], "NEW": [self.new], "OUTPUT_XLSX": report,
                                       "OUTPUT_CHANGED": "TEMPORARY_OUTPUT"}, feedback)
         self.assertEqual(result["CHANGED"], 1)
@@ -1307,7 +1219,7 @@ class CompareProcessingTests(unittest.TestCase):
                                                       style="eterra"))
         synthetic.write(self.new, "503.cgxml", Land(rings=[square_ring(100)], cadgenno="503",
                                                     ie="70002", sector="3"))
-        feedback = self.Feedback()
+        feedback = helpers.feedback()
         result = run("comparecgxml", {"OLD": [self.old], "NEW": [self.new],
                                       "MODE": cgxml_compare.MODES.index(cgxml_compare.IE),
                                       "OUTPUT_DELETED": "TEMPORARY_OUTPUT"}, feedback)
@@ -1324,7 +1236,7 @@ class CompareProcessingTests(unittest.TestCase):
         # the cadastral numbers of an eTerra export are not the IDs of a delivery
         eterra = self.converted("eterra", [[7339, 70001, None], [None, 70002, None]])
         livrare = self.converted("livrare", [[1101, 70001, 3], [1102, 70002, 3]])
-        result = run("comparelayers", {"OLD": eterra, "NEW": livrare}, self.Feedback())
+        result = run("comparelayers", {"OLD": eterra, "NEW": livrare}, helpers.feedback())
         self.assertEqual((result["ADDED"], result["DELETED"]), (0, 0))
 
     def test_a_column_the_new_layer_lacks_stops_the_run(self):
@@ -1404,7 +1316,7 @@ class CompareProcessingTests(unittest.TestCase):
                 result.features[0].setAttribute("id", "4424; 4472")
             return result
 
-        feedback = self.Feedback()
+        feedback = helpers.feedback()
         with mock.patch.object(cgxml_compare, "result_features", refusing):
             result = run("comparecgxml", {"OLD": [self.old], "NEW": [self.new],
                                           "OUTPUT_ADDED": "TEMPORARY_OUTPUT"}, feedback)
@@ -1422,19 +1334,6 @@ class ConversionProcessingTests(unittest.TestCase):
         self.addCleanup(helpers.remove_folder, self.tmp)
         self.addCleanup(QgsProject.instance().clear)
 
-    @staticmethod
-    def feedback():
-        """A feedback that keeps its messages: (warnings, errors as (text, fatal))."""
-        warnings, errors = [], []
-
-        class Feedback(QgsProcessingFeedback):
-            def pushWarning(self, message):
-                warnings.append(message)
-
-            def reportError(self, error, fatalError=False):
-                errors.append((error, fatalError))
-        return Feedback(), warnings, errors
-
     def save_layout(self, which, names, on=()):
         """Store the Coloane tab's layout for which with the given field names, as the window
         does; the keys in on are ticked as well."""
@@ -1448,19 +1347,21 @@ class ConversionProcessingTests(unittest.TestCase):
         self.addCleanup(settings_service.set_, key, "")
 
     def test_records_without_coordinates_are_reported_like_in_the_window(self):
-        feedback, warnings, _errors = self.feedback()
+        feedback = helpers.feedback()
         result = run("cgxmlconvert", {"INPUT": [helpers.DATA_DIR], "RECURSIVE": False,
                                       "OUTPUT_IMOBILE": "TEMPORARY_OUTPUT"}, feedback)
         self.assertEqual((result["IMOBILE"], result["OUTPUT_IMOBILE"].featureCount()), (4, 3))
-        self.assertIn("1 imobil nu are coordonate în fișier și nu apare în rezultat.", warnings)
+        self.assertIn("1 imobil nu are coordonate în fișier și nu apare în rezultat.", feedback.warnings)
 
     @unittest.skipUnless(os.name == "nt", "drive letters are a Windows matter")
-    def test_sources_on_two_drives_are_converted(self):
+    def test_sources_on_two_drives_are_converted_and_the_one_not_found_is_reported(self):
         other = "Y:" if os.path.splitdrive(self.tmp)[0].upper() == "Z:" else "Z:"
+        feedback = helpers.feedback()
         result = run("cgxmlconvert", {
             "INPUT": [helpers.DATA_DIR, other + "\\stick\\livrare_v2.zip"], "RECURSIVE": False,
-            "OUTPUT_IMOBILE": "TEMPORARY_OUTPUT"})
-        self.assertEqual(result["FILES"], 4)
+            "OUTPUT_IMOBILE": "TEMPORARY_OUTPUT"}, feedback)
+        self.assertEqual((result["FILES"], result["UNREAD"]), (4, 1))
+        self.assertEqual(feedback.errors, [("livrare_v2.zip: arhiva ZIP nu a fost găsită", False)])
 
     def test_a_shapefile_destination_refuses_names_that_end_up_the_same(self):
         # both names are cut to 'observatii' in a Shapefile
@@ -1481,13 +1382,13 @@ class ConversionProcessingTests(unittest.TestCase):
         folder = os.path.join(self.tmp, "src")
         synthetic.write(folder, "501.cgxml", Land(rings=[square_ring(0)], cadgenno="501",
                                                   notes="ș" * 200))
-        feedback, warnings, _errors = self.feedback()
+        feedback = helpers.feedback()
         run("cgxmlconvert", {"INPUT": [folder], "OUTPUT_IMOBILE": shapefile}, feedback)
         again = QgsVectorLayer(shapefile, "imobile", "ogr")
         self.assertEqual(roles.column_of(again, "id"), "identifica")
         self.assertEqual([f["identifica"] for f in again.getFeatures()], [501])
         self.assertIn("1 valoare a fost scurtată la 254 de octeți, limita formatului Shapefile "
-                      "(o literă cu diacritice ocupă doi octeți).", warnings)
+                      "(o literă cu diacritice ocupă doi octeți).", feedback.warnings)
 
     def test_a_geopackage_destination_refuses_the_names_it_keeps(self):
         self.save_layout("imobile", {"id": "FID"})
@@ -1546,13 +1447,13 @@ class ConversionProcessingTests(unittest.TestCase):
         report = os.path.join(self.tmp, "conversie.xlsx")
         # nobody can open a folder for writing, as nobody can write a workbook Excel holds
         os.makedirs(report)
-        feedback, _warnings, errors = self.feedback()
+        feedback = helpers.feedback()
         result = run("cgxmlconvert", {"INPUT": [helpers.DATA_DIR], "RECURSIVE": False,
                                       "OUTPUT_IMOBILE": "TEMPORARY_OUTPUT",
                                       "OUTPUT_XLSX": report}, feedback)
         self.assertEqual(result["OUTPUT_IMOBILE"].featureCount(), 3)
         self.assertNotIn("OUTPUT_XLSX", result)
-        [(error, fatal)] = errors
+        [(error, fatal)] = feedback.errors
         self.assertTrue(error.startswith("Fișierul 'conversie.xlsx' nu poate fi scris"), error)
         self.assertFalse(fatal)
 
@@ -1560,40 +1461,30 @@ class ConversionProcessingTests(unittest.TestCase):
         damaged = os.path.join(self.tmp, "descarcare.zip")
         with open(damaged, "wb") as fp:
             fp.write(b"PK\x03\x04 o descarcare intrerupta")
-        feedback, _warnings, errors = self.feedback()
+        feedback = helpers.feedback()
         result = run("cgxmlconvert", {"INPUT": [helpers.DATA_DIR, damaged], "RECURSIVE": False,
                                       "OUTPUT_IMOBILE": "TEMPORARY_OUTPUT"}, feedback)
         self.assertEqual((result["FILES"], result["UNREAD"], result["IMOBILE"]), (4, 1, 4))
         self.assertIn(("descarcare.zip: arhiva ZIP este deteriorată sau incompletă", False),
-                      errors)
+                      feedback.errors)
         # with no readable file there is nothing to convert
         with self.assertRaises(QgsProcessingException) as raised:
             run("cgxmlconvert", {"INPUT": [damaged], "OUTPUT_IMOBILE": "TEMPORARY_OUTPUT"})
         self.assertIn("Niciun fișier nu a putut fi citit", str(raised.exception))
 
-    @unittest.skipUnless(__import__("importlib").util.find_spec("ezdxf"), "ezdxf missing")
     def test_dxf_drawing_with_labels(self):
-        import ezdxf
+        from qgis.core import QgsVectorLayer  # type: ignore
         path = os.path.join(self.tmp, "conversie.dxf")
         result = run("cgxmlconvert", {"INPUT": [helpers.DATA_DIR], "RECURSIVE": False,
                                       "OUTPUT_IMOBILE": "TEMPORARY_OUTPUT", "OUTPUT_DXF": path})
         self.assertEqual(result["OUTPUT_DXF"], path)
-        msp = ezdxf.readfile(path).modelspace()
+        outlines = QgsVectorLayer(path + "|geometrytype=LineString", "contururi", "ogr")
         # 3 imobile, one of them with a hole, plus the construcție
-        self.assertEqual(len([e for e in msp if e.dxftype() == "LWPOLYLINE"]), 5)
-        texts = [e.dxf.text for e in msp if e.dxftype() == "TEXT"]
+        self.assertEqual(outlines.featureCount(), 5)
+        labels = QgsVectorLayer(path + "|geometrytype=Point", "etichete", "ogr")
+        texts = [feature["Text"] for feature in labels.getFeatures()]
         self.assertIn("ID 10188", texts)
         self.assertIn("IE 100001", texts)
-
-    def test_dxf_without_ezdxf_is_refused_before_reading(self):
-        from unittest import mock
-        from cadex.services import deps
-        with mock.patch.object(deps, "is_installed", lambda _module: False), \
-                self.assertRaises(QgsProcessingException) as raised:
-            run("cgxmlconvert", {"INPUT": [helpers.DATA_DIR], "OUTPUT_IMOBILE": "TEMPORARY_OUTPUT",
-                                 "OUTPUT_DXF": os.path.join(self.tmp, "conversie.dxf")})
-        self.assertIn("'ezdxf'", str(raised.exception))
-        self.assertFalse(os.path.exists(os.path.join(self.tmp, "conversie.dxf")))
 
 
 class UnreadableSourceProcessingTests(unittest.TestCase):
@@ -1653,21 +1544,17 @@ class UnreadableSourceProcessingTests(unittest.TestCase):
         with open(report, "rb") as fp:
             self.assertEqual(fp.read(), b"raportul de ieri")
 
-    def test_a_damaged_file_beside_a_file_without_coordinates_is_an_error_of_the_run(self):
+    def test_a_damaged_file_beside_a_file_without_coordinates_stops_the_run_with_both(self):
         folder = os.path.join(self.tmp, "eterra")
         synthetic.write(folder, "70001.cgxml", Land(rings=[], ie="70001", style="eterra"))
         with open(os.path.join(folder, "70002.cgxml"), "w", encoding="utf-8") as fp:
             fp.write("<CGXML><Land>")
-        errors = []
-
-        class Feedback(QgsProcessingFeedback):
-            def reportError(self, error, fatalError=False):
-                errors.append(error)
-
-        result = run("topologycheckcgxml", {"INPUT": [folder], "OUTPUT_AREAS": "TEMPORARY_OUTPUT",
-                                            "OUTPUT_POINTS": "TEMPORARY_OUTPUT"}, Feedback())
-        self.assertEqual(result["PROBLEMS"], 0)
-        self.assertTrue(any(error.startswith("70002.cgxml:") for error in errors), errors)
+        with self.assertRaises(QgsProcessingException) as raised:
+            run("topologycheckcgxml", {"INPUT": [folder], "OUTPUT_AREAS": "TEMPORARY_OUTPUT",
+                                       "OUTPUT_POINTS": "TEMPORARY_OUTPUT"})
+        message = str(raised.exception)
+        self.assertIn("Niciun imobil nu a putut fi verificat: sursa aleasă nu are niciun imobil "
+                      "cu coordonate. 1 fișier nu a putut fi citit:\n\n70002.cgxml:", message)
 
 
 class HelpTextProcessingTests(unittest.TestCase):
@@ -1723,18 +1610,11 @@ class TopologyReusedIdProcessingTests(unittest.TestCase):
         helpers.remove_folder(self.tmp)
 
     def test_both_are_checked_and_named_with_their_files(self):
-        messages = []
-
-        class Feedback(QgsProcessingFeedback):
-            def pushWarning(self, message):
-                messages.append(message)
-
-            def pushInfo(self, info):
-                messages.append(info)
-
+        feedback = helpers.feedback()
         result = run("topologycheckcgxml", {"INPUT": [self.tmp],
                                             "OUTPUT_AREAS": "TEMPORARY_OUTPUT",
-                                            "OUTPUT_POINTS": "TEMPORARY_OUTPUT"}, Feedback())
+                                            "OUTPUT_POINTS": "TEMPORARY_OUTPUT"}, feedback)
+        messages = feedback.warnings + feedback.infos
         self.assertEqual(result["PROBLEMS"], 0)
         self.assertIn("1 imobil apare în mai multe fișiere, în locuri diferite: 501. Fiecare "
                       "fișier s-a verificat ca imobil separat.", messages)
@@ -1866,22 +1746,17 @@ class SirutaProcessingTests(unittest.TestCase):
         self.addCleanup(setattr, siruta, "_problem", "")
         self.addCleanup(setattr, siruta, "_tables", None)
         siruta._tables = None
-        warnings = []
-
-        class Feedback(QgsProcessingFeedback):
-            def pushWarning(self, message):
-                warnings.append(message)
-                super().pushWarning(message)
+        feedback = helpers.feedback()
         # as when the plugin folder denies access to its database
         refused = sqlite3.OperationalError("unable to open database file")
         with mock.patch.object(siruta.sqlite3, "connect", side_effect=refused):
             result = run("cgxmlconvert", {
                 "INPUT": [helpers.DATA_DIR], "RECURSIVE": False,
                 "OUTPUT_IMOBILE": "TEMPORARY_OUTPUT", "OUTPUT_CONSTRUCTII": "TEMPORARY_OUTPUT"},
-                Feedback())
+                feedback)
         self.assertEqual(result["IMOBILE"], 4)
         self.assertIn("Baza de date SIRUTA a pluginului nu a putut fi citită, deci denumirile "
-                      "de UAT, județ și localitate lipsesc din rezultat.", warnings)
+                      "de UAT, județ și localitate lipsesc din rezultat.", feedback.warnings)
 
 
 def square_ring(x, size=20):
@@ -1889,7 +1764,6 @@ def square_ring(x, size=20):
 
 
 def tearDownModule():
-    QgsApplication.processingRegistry().removeProvider(PROVIDER)
     helpers.stop_qgis()
 
 

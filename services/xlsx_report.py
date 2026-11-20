@@ -4,7 +4,6 @@
 """Excel report layout shared by the tools: data tables and the Sumar sheet."""
 
 import math
-import re
 from datetime import date, datetime, time, timedelta
 
 from . import fmt, xlsx
@@ -23,10 +22,13 @@ BAD = "FBE0DE"
 MIXED = "FDF1CC"
 NOTE = "E8E1F3"
 
-_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-
 DATE_FORMAT = "dd.mm.yyyy"
 DATETIME_FORMAT = "dd.mm.yyyy hh:mm"
+# every digit of a whole number: from 12 digits on, Excel's General format shows 1.23457E+11
+WHOLE_FORMAT = "0"
+LONG_NUMBER = 10 ** 11
+# Excel keeps 15 digits of a number, so a longer whole number is written as text
+TEXT_NUMBER = 10 ** 15
 # day 0 of Excel's date numbers; they include 29 February 1900, which did not exist, so they
 # are right only from 1 March 1900 and earlier dates are written as text
 _EXCEL_EPOCH = datetime(1899, 12, 30)
@@ -42,9 +44,10 @@ class Formatted:
 
 
 def cell_value(value):
-    """A storable cell value: NULL becomes empty, numbers stay numbers, dates become Excel
-    dates (Formatted), so a filter groups them by year and month and a sort is chronological,
-    times become hh:mm:ss text, anything else text."""
+    """A storable cell value. NULL becomes empty; a bool becomes Da or Nu; a number stays a
+    number, except a whole number of 16 or more digits, which becomes text; a date becomes
+    an Excel date (Formatted), so a filter groups it by year and month and a sort is
+    chronological; a time becomes hh:mm:ss text; anything else becomes text."""
     if value is None:
         return None
     if isinstance(value, bool):
@@ -52,6 +55,8 @@ def cell_value(value):
     if isinstance(value, (int, float)):
         if isinstance(value, float) and value != value:  # NaN
             return None
+        if isinstance(value, int) and abs(value) >= TEXT_NUMBER:
+            return str(value)
         return value
     if isinstance(value, datetime):
         return _excel_date(value.replace(tzinfo=None), DATETIME_FORMAT)
@@ -70,7 +75,7 @@ def cell_value(value):
         if type_name == "QDateTime":
             return cell_value(value.toPyDateTime())
         return value.toString("HH:mm:ss")
-    return _CONTROL.sub(" ", str(value))
+    return xlsx.clean_text(str(value))
 
 
 def _excel_date(moment: datetime, number_format):
@@ -93,6 +98,11 @@ def _split(value):
     stored = cell_value(value)
     if isinstance(stored, Formatted):
         return stored.value, stored.number_format
+    if isinstance(stored, xlsx.Percent):
+        return float(stored), stored.number_format
+    if isinstance(stored, (int, float)) and abs(stored) >= LONG_NUMBER \
+            and (isinstance(stored, int) or stored.is_integer()):
+        return stored, WHOLE_FORMAT
     return stored, None
 
 
@@ -242,3 +252,17 @@ class Summary:
 
 def save(wb, path: str):
     wb.save(path)
+
+
+def cut_note(count) -> str:
+    """The sentence for a report in which count cells were cut to the length a cell holds
+    (Workbook.cut_cells), "" for none."""
+    if not count:
+        return ""
+    return fmt.plural(
+        count,
+        "{0} din fișierul Excel a fost scurtată la {1} de caractere, cât cuprinde o celulă "
+        "Excel.",
+        "{0} din fișierul Excel au fost scurtate la {1} de caractere, cât cuprinde o celulă "
+        "Excel.").format(fmt.count(count, "celulă", "celule"),
+                         fmt.number(xlsx.MAX_CELL_TEXT, 0))

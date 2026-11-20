@@ -7,7 +7,7 @@ import os
 import zipfile
 from datetime import datetime
 
-from qgis.PyQt.QtCore import Qt  # type: ignore
+from qgis.PyQt.QtCore import Qt, QTimer  # type: ignore
 from qgis.PyQt.QtGui import QBrush, QColor  # type: ignore
 from qgis.PyQt.QtWidgets import (  # type: ignore
     QCheckBox, QComboBox, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QGroupBox,
@@ -23,9 +23,7 @@ from .widgets import (
     ExistingFiles, PathRow, StatusLabel, add_field_row, fill_field_combo, make_form,
     preselect_layer, user_chose,
 )
-from ..services import (
-    dialog_memory, diminuare_service, fmt, outputs, roles, settings_service, xlsx_report,
-)
+from ..services import dialog_memory, diminuare_service, fmt, outputs, xlsx_report
 
 # same row tints as the Excel output
 FIXED_TINT = "#" + xlsx_report.NOTE
@@ -33,6 +31,8 @@ BAD_TINT = "#" + xlsx_report.BAD
 ROW_TEXT = "#" + xlsx_report.BODY
 TABLE_MIN_ROWS = 4
 DEFAULT_HEIGHT = 900
+# milliseconds without a key before a contour area being typed gives its result
+TYPING_PAUSE = 400
 RIGHT = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
 
 
@@ -47,11 +47,17 @@ class DiminuareDialog(BaseDialog):
         self._rows = []
         self._numbers = []
         self._hidden = []
+        # the rows with the word total, found once for a table; which of them are total rows
+        # depends on the area column, so that is decided at each calculation
+        self._total_candidates = {}
+        self._totals = {}
         self._result = None
         self._loaded_path = ""
         self._selection_layer = None
         # where the contour area came from, for the Sumar; empty when typed by hand
         self._contour_origin = ""
+        # the area taken from the geometry, with all its decimals; None when typed by hand
+        self._contour_exact = None
         self._setting_contour = False
         self._setup_ui()
         # a saved geometry replaces this on show
@@ -83,8 +89,8 @@ class DiminuareDialog(BaseDialog):
         self.fixed_combo = QComboBox()
         self.fixed_combo.setToolTip(self.tr(
             "Parcelele care au o valoare în această coloană au CF/IE și își păstrează "
-            "suprafața. O celulă necompletată sau cu 0, NU, NO, FALSE ori FĂRĂ "
-            "înseamnă fără CF/IE."))
+            "suprafața. O celulă necompletată sau cu 0, NU, NO, FALSE, FĂRĂ, LIPSĂ, NU ARE, "
+            "N/A, un semn de întrebare ori o liniuță înseamnă fără CF/IE."))
         self.fixed_combo.currentIndexChanged.connect(lambda *_: self._calculate())
         form.addRow(self.tr("Coloana CF/IE:"), self.fixed_combo)
         self.rows_label = StatusLabel()
@@ -122,6 +128,13 @@ class DiminuareDialog(BaseDialog):
         self.contour_spin.setSuffix(" mp")
         self.contour_spin.setToolTip(self.tr(
             "Preluată din geometrie sau introdusă manual."))
+        # an area typed digit by digit gives one result, when the typing stops; the timer is
+        # started before valueChanged arrives for the same key
+        self._typing = QTimer(self)
+        self._typing.setSingleShot(True)
+        self._typing.setInterval(TYPING_PAUSE)
+        self._typing.timeout.connect(self._calculate)
+        self.contour_spin.lineEdit().textEdited.connect(lambda *_: self._typing.start())
         self.contour_spin.valueChanged.connect(self._on_contour_changed)
         area_line.addWidget(self.contour_spin, 1)
         take_btn = QPushButton(self.tr("Preia din geometrie"))
@@ -146,7 +159,9 @@ class DiminuareDialog(BaseDialog):
         self.round_combo.addItem(self.tr("la două zecimale"), 2)
         self.round_combo.setToolTip(self.tr(
             "Suprafețele noi se rotunjesc astfel încât suma tuturor parcelelor să fie "
-            "egală cu suprafața conturului, rotunjită la aceeași precizie."))
+            "egală cu suprafața conturului, rotunjită la aceeași precizie, fără ca vreo "
+            "parcelă să primească o suprafață mai mare decât cea din acte. Când suma este "
+            "alta, fereastra o arată."))
         self.round_combo.currentIndexChanged.connect(lambda *_: self._calculate())
         calc_form.addRow(self.tr("Rotunjire:"), self.round_combo)
         self.body.addWidget(calc)
@@ -185,8 +200,11 @@ class DiminuareDialog(BaseDialog):
                                         primary=True)
         self.add_close_button()
 
-        self.remember("file", self.file_row.edit)
+        self.remember("file", self.file_row.edit, per_project=True)
         self.remember("rounding", self.round_combo)
+        # the columns picked by hand; they are selected once a table that has them is read
+        self.remember("area_column", self.area_combo, column=True)
+        self.remember("fixed_column", self.fixed_combo, column=True)
         self.restore_remembered()
         self._watch_selection()
         self._calculate()
@@ -207,7 +225,7 @@ class DiminuareDialog(BaseDialog):
                 (BAD_TINT, self.tr("rând de total sau fără o suprafață validă, "
                                    "rămâne neschimbat"))):
             swatch = QLabel()
-            swatch.setPixmap(_ui_helpers.swatch_icon(color).pixmap(12, 12))
+            swatch.setPixmap(_ui_helpers.swatch_pixmap(color))
             row.addWidget(swatch)
             row.addWidget(QLabel(text))
             row.addSpacing(12)
@@ -262,28 +280,24 @@ class DiminuareDialog(BaseDialog):
             if not quiet:
                 self.fail(self.tr("Tabelul nu poate fi citit:\n\n{0}").format(e))
             return
-        first = not self._loaded_path
         self._loaded_path = path
         self.sheet_combo.blockSignals(True)
         self.sheet_combo.clear()
         self.sheet_combo.addItems(table.names)
-        if sheet in table.names:
-            self.sheet_combo.setCurrentText(sheet)
+        # the sheet read, which is not the first one when that is hidden in Excel
+        if table.sheet in table.names:
+            self.sheet_combo.setCurrentText(table.sheet)
         self.sheet_combo.blockSignals(False)
         self._header, self._rows, self._numbers = table.header, table.rows, table.numbers
         self._hidden = table.hidden
-        keep_area = self.area_combo.currentData() or self._stored("area_column")
-        keep_fixed = self._fixed_choice(first)
-        fill_field_combo(self.area_combo, table.header, "fields/area_deed", keep=keep_area)
-        fill_field_combo(self.fixed_combo, table.header, None,
+        self._total_candidates = diminuare_service.total_candidates(table.rows)
+        fill_field_combo(self.area_combo, table.header, "fields/area_deed",
+                         keep=self.area_combo.currentData())
+        fixed = self.fixed_combo
+        # the user's choice of no column stays a choice through reloads
+        keep_fixed = fixed.currentData() or ("" if user_chose(fixed) else None)
+        fill_field_combo(fixed, table.header, "fields/ie",
                          self.tr("(nicio parcelă nu are CF/IE)"), keep=keep_fixed)
-        if keep_fixed == "":
-            # the user's choice of no column stays a choice through reloads
-            _ui_helpers.apply_widget_state(self.fixed_combo, "")
-        elif self.fixed_combo.currentData() != keep_fixed:
-            match = roles.pick_field(table.header, settings_service.patterns("fields/ie"))
-            if match:
-                self.fixed_combo.setCurrentIndex(self.fixed_combo.findData(match))
         self._show_rows(table)
         self._calculate()
 
@@ -308,30 +322,10 @@ class DiminuareDialog(BaseDialog):
         now in the path field."""
         self._loaded_path = ""
         self._header, self._rows, self._numbers, self._hidden = [], [], [], []
+        self._total_candidates = {}
         self.sheet_combo.clear()
         self.rows_label.set_status("")
         self._calculate()
-
-    def _fixed_choice(self, first):
-        """The CF/IE column to keep selected: "" when the user chose none, in this window or
-        at the last run; None when no column was chosen, and one is preselected by name.
-        first is True for the first table the window reads."""
-        combo = self.fixed_combo
-        if user_chose(combo):
-            return combo.currentData() or ""
-        if combo.currentData():
-            return combo.currentData()
-        if first:
-            name = type(self).__name__
-            stored = dialog_memory.load(name, "fixed_column", "") or ""
-            # read from the settings file, the value is text
-            chosen = str(dialog_memory.load(name, "fixed_column_chosen", False)).lower()
-            if stored or chosen in ("true", "1"):
-                return stored
-        return None
-
-    def _stored(self, key):
-        return dialog_memory.load(type(self).__name__, key, "") or None
 
     def _watch_selection(self, *_args):
         # keeps the selected feature count next to the check box current
@@ -373,7 +367,17 @@ class DiminuareDialog(BaseDialog):
     def _on_contour_changed(self, *_args):
         if not self._setting_contour:
             self._contour_origin = ""
-        self._calculate()
+            self._contour_exact = None
+        if not self._typing.isActive():
+            self._calculate()
+
+    def _contour(self) -> float:
+        """The contour area of the calculation: as taken from the geometry, else as written in
+        the field. The field shows two decimals: an area of 1234.497 shows as 1234.50, which
+        rounds to 1235, while the area itself rounds to 1234."""
+        if self._contour_exact is not None:
+            return self._contour_exact
+        return self.contour_spin.value()
 
     def _take_area(self):
         layer = self.layer_combo.currentLayer()
@@ -397,12 +401,19 @@ class DiminuareDialog(BaseDialog):
         if area <= 0:
             self.warn(self.tr("Geometria aleasă are suprafața 0."))
             return
+        shown = round(area, 2)
+        same = self.contour_spin.value() == shown
         self._setting_contour = True
         try:
-            self.contour_spin.setValue(round(area, 2))
+            self._contour_exact = area
+            self.contour_spin.setValue(shown)
         finally:
             self._setting_contour = False
         self._contour_origin = f"{layer.name()}, {used}"
+        if same:
+            # setValue() emits nothing for an unchanged value, so the calculation with the
+            # exact area runs here
+            self._calculate()
 
     # --- calculation ---
 
@@ -424,7 +435,7 @@ class DiminuareDialog(BaseDialog):
         if not area_name:
             self._clear_result(self.tr("Alegeți coloana cu suprafața din acte."))
             return
-        contour = self.contour_spin.value()
+        contour = self._contour()
         if contour <= 0:
             self._clear_result(self.tr("Completați suprafața conturului: preluați-o din "
                                        "geometrie sau introduceți-o manual."))
@@ -436,8 +447,8 @@ class DiminuareDialog(BaseDialog):
         flags = [diminuare_service.has_value(r[fixed_col]) if fixed_col is not None
                  else False for r in self._rows]
         decimals = self.round_combo.currentData()
-        result = diminuare_service.compute(areas, flags, contour, decimals,
-                                           diminuare_service.total_rows(self._rows))
+        self._totals = diminuare_service.total_rows(self._rows, areas, self._total_candidates)
+        result = diminuare_service.compute(areas, flags, contour, decimals, self._totals)
         if result.error:
             self._clear_result(result.error, "warning")
             return
@@ -445,21 +456,40 @@ class DiminuareDialog(BaseDialog):
 
         notes = []
         level = None
-        if result.contour > result.total_deed:
-            notes.append(self.tr("Conturul este mai mare decât suma din acte, deci "
-                                 "suprafețele cresc."))
+        note = diminuare_service.sum_note(result)
+        if note:
+            notes.append(note)
             level = "info"
-        target = diminuare_service.round_half_up(result.contour, decimals)
-        if abs(result.total_new - target) > 1e-6:
-            notes.append(self.tr("Parcelele cu CF/IE au mai multe zecimale decât rotunjirea "
-                                 "aleasă, deci suma nouă este {0}, nu {1}.").format(
-                fmt.area(result.total_new), fmt.area(target)))
-            level = "info"
+        kept = [i for i in self._total_candidates if i not in self._totals]
+        if kept:
+            notes.append(fmt.plural(len(kept), self.tr(
+                "{0} cu cuvântul 'total' sau 'sumă' a rămas parcelă, fiindcă are datele unei "
+                "parcele, iar suprafața lui nu este suma rândurilor de deasupra: {1}."),
+                self.tr(
+                    "{0} cu cuvântul 'total' sau 'sumă' au rămas parcele, fiindcă au datele unei "
+                    "parcele, iar suprafața lor nu este suma rândurilor de deasupra: {1}.")
+            ).format(fmt.count(len(kept), self.tr("rând"), self.tr("rânduri")),
+                     diminuare_service.row_list([self._numbers[i] for i in kept])))
+            # a total row taken for a parcel doubles the sum of the deed areas
+            level = "warning"
         negative = set(result.negative_rows)
         for indexes, one, many in (
-                (result.left_out,
+                ([i for i in result.left_out
+                  if self._totals[i] == diminuare_service.TOTAL_BY_WORD],
                  self.tr("{0} de total sau subtotal a fost lăsat deoparte: {1}."),
                  self.tr("{0} de total sau subtotal au fost lăsate deoparte: {1}.")),
+                ([i for i in result.left_out
+                  if self._totals[i] == diminuare_service.TOTAL_BY_SUM],
+                 self.tr("{0} de total sau subtotal a fost lăsat deoparte, având suprafața "
+                         "egală cu suma rândurilor de deasupra: {1}."),
+                 self.tr("{0} de total sau subtotal au fost lăsate deoparte, având suprafața "
+                         "egală cu suma rândurilor de deasupra: {1}.")),
+                ([i for i in result.left_out
+                  if self._totals[i] == diminuare_service.TOTAL_BY_LABEL],
+                 self.tr("{0} de total sau subtotal a fost lăsat deoparte, având doar "
+                         "denumirea și numere, fără datele unei parcele: {1}."),
+                 self.tr("{0} de total sau subtotal au fost lăsate deoparte, având doar "
+                         "denumirea și numere, fără datele unei parcele: {1}.")),
                 ([i for i in result.bad_rows if i not in negative],
                  self.tr("{0} fără o suprafață numerică a rămas neschimbat: {1}."),
                  self.tr("{0} fără o suprafață numerică au rămas neschimbate: {1}.")),
@@ -477,7 +507,7 @@ class DiminuareDialog(BaseDialog):
             "<table cellspacing='0' cellpadding='2'><tr>"
             f"<td>A = <b>{fmt.area(result.total_deed)}</b></td><td width='16'></td>"
             f"<td>B = <b>{fmt.area(result.total_fixed)}</b></td><td width='16'></td>"
-            f"<td>C = <b>{fmt.area(result.contour)}</b></td></tr><tr>"
+            f"<td>C = <b>{fmt.area(result.contour, 4)}</b></td></tr><tr>"
             f"<td>{self.tr('Factor')} = <b>{factor}</b></td>"
             "<td></td><td colspan='3'>"
             + self.tr("Diminuare = {0} pentru fiecare parcelă fără CF/IE").format(
@@ -491,6 +521,9 @@ class DiminuareDialog(BaseDialog):
     def _fill_table(self, result, areas, fixed_col):
         fixed = set(result.fixed_rows)
         bad = set(result.bad_rows) | set(result.left_out)
+        # filled from empty: on a shown table, every item put in place of another makes the
+        # header measure the whole 'Rând' column again
+        self.table.setRowCount(0)
         self.table.setRowCount(len(areas))
         for i, area in enumerate(areas):
             new = result.new_areas[i]
@@ -510,13 +543,14 @@ class DiminuareDialog(BaseDialog):
 
     def _remember_choices(self):
         self.save_remembered()
-        name = type(self).__name__
-        dialog_memory.save(name, "area_column", self.area_combo.currentData() or "")
-        dialog_memory.save(name, "fixed_column", self.fixed_combo.currentData() or "")
-        # an empty CF/IE column is kept next time only when the user picked it
-        dialog_memory.save(name, "fixed_column_chosen", user_chose(self.fixed_combo))
+        # where CADex 0.2.0 kept, for the whole profile, whether the CF/IE column was picked
+        dialog_memory.remove(type(self).__name__, "fixed_column_chosen")
 
     def _save(self):
+        if self._typing.isActive():
+            # an area still being typed: what is saved is the result for the area in the field
+            self._typing.stop()
+            self._calculate()
         if self._result is None:
             return
         result, area_col, fixed_col = self._result
@@ -553,9 +587,12 @@ class DiminuareDialog(BaseDialog):
             meta.append(("Rânduri ascunse în Excel, lăsate deoparte",
                          fmt.count(len(self._hidden), "rând", "rânduri") + ": "
                          + diminuare_service.row_list(self._hidden)))
+        if self._totals:
+            meta.append(("Rânduri de total, lăsate deoparte", diminuare_service.total_list(
+                self._totals, lambda i: str(self._numbers[i]))))
         try:
-            diminuare_service.write_excel(path, self._header, self._rows, result, meta,
-                                          area_col, fixed_col)
+            cut = diminuare_service.write_excel(path, self._header, self._rows, result, meta,
+                                                area_col, fixed_col)
         except OSError as error:
             self.fail(outputs.write_error(path, error))
             return
@@ -566,8 +603,13 @@ class DiminuareDialog(BaseDialog):
         fixed, bad, left_out = (len(result.fixed_rows), len(result.bad_rows),
                                 len(result.left_out))
         negative = len(result.negative_rows)
-        counts = [(self.tr("Parcele diminuate"), len(self._rows) - fixed - bad - left_out,
-                   None)]
+        others = len(self._rows) - fixed - bad - left_out
+        if result.surplus > 0:
+            counts = [(self.tr("Conturul depășește suma din acte cu"),
+                       fmt.area(result.surplus), None),
+                      (self.tr("Parcele fără CF/IE, neschimbate"), others, None)]
+        else:
+            counts = [(self.tr("Parcele diminuate"), others, None)]
         if fixed:
             counts.append((self.tr("Parcele cu CF/IE, neschimbate"), fixed, FIXED_TINT))
         if left_out:
@@ -577,7 +619,21 @@ class DiminuareDialog(BaseDialog):
                            BAD_TINT))
         if negative:
             counts.append((self.tr("Rânduri cu suprafața negativă"), negative, BAD_TINT))
+        notes = [self.tr("În fișier, rândurile sunt colorate la fel ca aici.")]
+        if cut:
+            notes.append(xlsx_report.cut_note(cut))
         self.show_result(self.tr("Rezultatul a fost salvat în {0}.").format(
-            os.path.basename(path)), counts=counts,
-            notes=[self.tr("În fișier, rândurile sunt colorate la fel ca aici.")],
-            file_path=path)
+            os.path.basename(path)), counts=counts, notes=notes, file_path=path,
+            warning=bool(cut))
+
+    def project_changed(self):
+        super().project_changed()
+        self._selection_chosen = False
+        preselect_layer(self.layer_combo, "roles/contur", self.iface)
+        # the table read and the contour area belong to the project that was closed; this
+        # project's table is looked for on a worker thread, as when the window is built
+        self.contour_spin.setValue(0.0)
+        self._forget_table()
+        if self.file_row.path():
+            self.rows_label.set_status(self.tr("Se caută tabelul..."))
+            self._existing.check([self.file_row.path()])

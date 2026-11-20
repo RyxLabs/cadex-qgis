@@ -518,10 +518,15 @@ class EterraAgainstDeliveryTests(unittest.TestCase):
             505, [square(501000.004, 400000, 200)], ie="70004"))
         task = self.run_task()
         self.assertNotIn("70004", [o.key for o in task.changed])
-        self.assertIn("Limitele mutate cu cel mult 1 cm, cât este precizia coordonatelor, nu "
-                      "s-au considerat modificări: 1 imobil.", task.notes())
+        self.assertIn("Limitele mutate cu cel mult 1 cm, cât este precizia coordonatelor, și "
+                      "diferența de suprafață măsurată care rezultă din ele nu s-au considerat "
+                      "modificări: 1 imobil.", task.notes())
         # between two deliveries every move over the tolerance counts
-        both = {o.key: o for o in self.run_task(mode=cc.FILENAME, excel_path=None).changed}
+        earlier = os.path.join(self.tmp, "livrare_1")
+        synthetic.write(earlier, "505.cgxml", delivery(505, [square(501000, 400000, 200)],
+                                                       ie="70004"))
+        both = {o.key: o for o in self.run_task(old_paths=[earlier], mode=cc.FILENAME,
+                                                excel_path=None).changed}
         self.assertIsNotNone(both["505"].moved)
         # and 3 cm is a move
         synthetic.write(self.livrare, "505.cgxml", delivery(
@@ -697,14 +702,11 @@ class CompareEngineDeliveryTests(unittest.TestCase):
         synthetic.write(self.new, "10001.cgxml", delivery(
             10001, [ring], buildings=[Building(1, [square(500003, 400002, 5)])]))
         task = self.run_task(compare_geometry=False, building_columns=[])
-        _names, rows = xlsx.read_rows(task.excel_path, "Sumar")
-        facts = {r[0]: r[1] for r in rows if r and len(r) > 1}
-        self.assertEqual(facts["Construcții comparate"],
+        self.assertEqual(helpers.summary_facts(task.excel_path)["Construcții comparate"],
                          "Da: doar construcțiile apărute și dispărute")
         task = self.run_task(building_columns=[])
-        _names, rows = xlsx.read_rows(task.excel_path, "Sumar")
-        facts = {r[0]: r[1] for r in rows if r and len(r) > 1}
-        self.assertEqual(facts["Construcții comparate"], "Da: doar geometria")
+        self.assertEqual(helpers.summary_facts(task.excel_path)["Construcții comparate"],
+                         "Da: doar geometria")
         # the kinds of change of the construcții, as for the imobile
         self.assertIn(["   Doar limita", 1],
                       [r[:2] for r in summary_section(task.excel_path, "Construcții")])
@@ -1101,6 +1103,319 @@ class SirutaCompareTests(unittest.TestCase):
         task = self.compare()
         self.assertNotEqual(task.changed[0].record["uat"], "")
         self.assertNotIn(self.NOTE, task.notes())
+
+
+class SourceKindTest(unittest.TestCase):
+    """Folders of deliveries and eTerra exports compared in both pairing modes."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="cadex_cmp_kind_")
+        self.addCleanup(helpers.remove_folder, self.tmp)
+
+    def folder(self, name):
+        return os.path.join(self.tmp, name)
+
+    def compare(self, old, new, **options):
+        task = cc.CgxmlCompareTask(old_paths=[self.folder(old)], new_paths=[self.folder(new)],
+                                   **options)
+        self.assertTrue(task.run(), task.error_msg)
+        return task
+
+    def facts(self, task):
+        """The facts of the report's Sumar sheet."""
+        return helpers.summary_facts(task.excel_path)
+
+
+def changes_of(task):
+    return {o.key: o.changes for o in task.changed}
+
+
+class TwoDeliveriesTests(SourceKindTest):
+    """Two deliveries: 1 loses its deed area, 2 gets one in place of 0, 3 has it rounded, 4
+    moves by 8 mm along a 200 m side, 5, an imobil without IE, has a new owner, 6 loses its
+    fence."""
+
+    COLUMNS = ["sup_mas", "sup_acte", "propr", "imprej"]
+
+    def setUp(self):
+        super().setUp()
+        x = 500000
+        for name, legal, shift, owner, fence in (("v1", (500.0, 0, 1250.4), 0, "A B", True),
+                                                 ("v2", (None, 400.0, 1250.0), 0.008, "C D", None)):
+            folder = self.folder(name)
+            for number in (1, 2, 3):
+                synthetic.write(folder, f"{number}.cgxml", delivery(
+                    number, [square(x + 100 * number, 400000, 20)], ie=str(70000 + number),
+                    legal_area=legal[number - 1]))
+            synthetic.write(folder, "4.cgxml", delivery(
+                4, [square(x + 1000 + shift, 400000, 200)], ie="70004"))
+            synthetic.write(folder, "5.cgxml", delivery(5, [square(x + 500, 400000, 20)],
+                                                        owner=owner))
+            synthetic.write(folder, "6.cgxml", delivery(6, [square(x + 600, 400000, 20)],
+                                                        ie="70006", enclosed=fence))
+
+    def test_every_change_between_two_deliveries_is_reported_by_ie_as_by_name(self):
+        for mode in cc.MODES:
+            task = self.compare("v1", "v2", mode=mode, columns=self.COLUMNS)
+            self.assertEqual((task.matched, len(task.changed), task.unchanged), (6, 6, 0), mode)
+            self.assertEqual((task.added, task.deleted, task.ignored), ([], [], []), mode)
+            self.assertEqual((task.one_sided, task.rounded, task.split), ({}, {}, 0), mode)
+            self.assertEqual(task.within_precision["imobile"], 0, mode)
+            changes = sorted(change for o in task.changed for change in o.changes)
+            self.assertEqual(changes, [("imprej", "Da", ""), ("propr", "A B", "C D"),
+                                       ("sup_acte", 0.0, 400.0), ("sup_acte", 500.0, None),
+                                       ("sup_acte", 1250.4, 1250.0)], mode)
+            self.assertEqual(sum(1 for o in task.changed if o.moved), 1, mode)
+            self.assertEqual([note for note in task.notes() if "eTerra" in note], [], mode)
+
+    def test_a_delivery_compared_with_itself_is_unchanged_by_ie_and_by_name(self):
+        # two imobile that keep the IE of the eTerra imobil they were split from
+        for number in (7, 8):
+            synthetic.write(self.folder("v1"), f"{number}.cgxml", delivery(
+                number, [square(500700 + 30 * number, 400000, 20)], ie="70007"))
+        for mode in cc.MODES:
+            task = self.compare("v1", "v1", mode=mode)
+            self.assertEqual((task.matched, task.unchanged), (8, 8), mode)
+            self.assertEqual((task.changed, task.added, task.deleted, task.ignored),
+                             ([], [], [], []), mode)
+            self.assertEqual(task.split, 0, mode)
+
+    def test_two_deliveries_swapped_give_the_same_changes_the_other_way_round(self):
+        there = self.compare("v1", "v2", mode=cc.IE, columns=self.COLUMNS)
+        back = self.compare("v2", "v1", mode=cc.IE, columns=self.COLUMNS)
+        self.assertEqual({key: sorted((c, repr(new), repr(old)) for c, old, new in changes)
+                          for key, changes in changes_of(there).items()},
+                         {key: sorted((c, repr(old), repr(new)) for c, old, new in changes)
+                          for key, changes in changes_of(back).items()})
+        self.assertEqual((back.added, back.deleted, back.ignored), ([], [], []))
+
+    def test_by_ie_a_file_without_a_pair_is_looked_up_by_cadastral_number_then_by_name(self):
+        # 5 has no IE; its file has another name in the second delivery
+        os.rename(os.path.join(self.folder("v2"), "5.cgxml"),
+                  os.path.join(self.folder("v2"), "Sector_3__5.cgxml"))
+        # an imobil without IE or cadastral number, and one found in the first delivery only
+        for name in ("v1", "v2"):
+            synthetic.write(self.folder(name), "nou.cgxml", Land(
+                rings=[square(500900, 400000, 20)], sector="3"))
+        synthetic.write(self.folder("v1"), "9.cgxml", delivery(9, [square(500950, 400000, 20)]))
+        task = self.compare("v1", "v2", mode=cc.IE, columns=["propr"],
+                            excel_path=self.folder("raport.xlsx"))
+        self.assertEqual(task.matched, 7)
+        self.assertEqual({key: changes for key, changes in changes_of(task).items() if changes},
+                         {"ID 5": [("propr", "A B", "C D")]})
+        self.assertEqual([(o.key, o.file_old) for o in task.deleted], [("fără IE", "9.cgxml")])
+        self.assertEqual((task.added, task.ignored), ([], []))
+        self.assertIn(("Imobile potrivite după numărul cadastral sau după nume", 2),
+                      task.summary_rows())
+        self.assertEqual(task.renamed_text(), "2 imobile fără pereche după IE au fost găsite "
+                                              "după numărul cadastral sau după numele fișierului.")
+        self.assertEqual(self.facts(task)["Export eTerra"], "Niciuna dintre surse")
+
+    def test_by_ie_an_ie_shared_by_two_files_pairs_neither_of_them(self):
+        # the second delivery gives 2 the IE of 1: 1 and 2 are found by their cadastral number
+        synthetic.write(self.folder("v2"), "2.cgxml", delivery(
+            2, [square(500200, 400000, 20)], ie="70001", legal_area=400.0,
+            buildings=[Building(1, [square(500202, 400002, 5)])]))
+        task = self.compare("v1", "v2", mode=cc.IE, columns=["sup_acte"])
+        self.assertEqual((task.matched, task.split, task.ignored), (6, 0, []))
+        self.assertEqual(changes_of(task)["ID 2"], [("sup_acte", 0.0, 400.0)])
+        # its new construcție is named by the same imobil
+        self.assertEqual([(o.imobil, o.key) for o in task.buildings_added], [("ID 2", "C1")])
+
+
+class TwoExportsTests(SourceKindTest):
+
+    def test_a_zero_in_either_export_is_a_value_whichever_comes_first(self):
+        ring = square(500000, 400000, 20)
+        for name, legal in (("ianuarie", 0), ("martie", 400.0)):
+            synthetic.write(self.folder(name), "70001.cgxml", Land(
+                rings=[ring], ie="70001", legal_area=legal, style="eterra"))
+        for mode in cc.MODES:
+            there = self.compare("ianuarie", "martie", mode=mode, columns=["sup_acte"],
+                                 excel_path=self.folder("raport.xlsx"))
+            self.assertEqual(changes_of(there), {"70001": [("sup_acte", 0.0, 400.0)]}, mode)
+            back = self.compare("martie", "ianuarie", mode=mode, columns=["sup_acte"])
+            self.assertEqual(changes_of(back), {"70001": [("sup_acte", 400.0, 0.0)]}, mode)
+            self.assertEqual(self.facts(there)["Export eTerra"], "Ambele surse")
+            self.assertEqual(there.one_sided, {})
+
+
+class ExportAgainstDeliveryTests(SourceKindTest):
+    """An eTerra export of three imobile and their delivery: 70001 with the deed area only in
+    eTerra and the fence only in the delivery, 70002 with an area rounded in the delivery,
+    70003 split into 503 and 504."""
+
+    def setUp(self):
+        super().setUp()
+        x = 500000
+        eterra, livrare = self.folder("eterra"), self.folder("livrare")
+        synthetic.write(eterra, "70001.cgxml", Land(rings=[square(x, 400000, 20)], ie="70001",
+                                                    legal_area=500.0, style="eterra"))
+        synthetic.write(livrare, "501.cgxml", delivery(501, [square(x, 400000, 20)],
+                                                       ie="70001", enclosed=False))
+        synthetic.write(eterra, "70002.cgxml", Land(rings=[square(x + 100, 400000, 20)],
+                                                    ie="70002", legal_area=1250.37,
+                                                    style="eterra"))
+        synthetic.write(livrare, "502.cgxml", delivery(502, [square(x + 100, 400000, 20)],
+                                                       ie="70002", legal_area=1250.0))
+        synthetic.write(eterra, "70003.cgxml", Land(rings=[square(x + 200, 400000, 20)],
+                                                    ie="70003", style="eterra"))
+        for side, number in enumerate((503, 504)):
+            synthetic.write(livrare, f"{number}.cgxml", delivery(
+                number, [half(x + 200, side)], ie="70003"))
+
+    def test_by_file_name_the_pairs_are_compared_as_an_export_and_a_delivery(self):
+        for old, new, side in (("eterra", "livrare", "Sursa veche"),
+                               ("livrare", "eterra", "Sursa nouă")):
+            task = self.compare(old, new, excel_path=self.folder("raport.xlsx"))
+            self.assertEqual((task.matched, task.changed, task.unchanged), (2, [], 2), old)
+            self.assertEqual(task.one_sided, {"sup_acte": 1}, old)
+            self.assertEqual(task.rounded, {"sup_acte": 1}, old)
+            # the export has no fence on any imobil
+            self.assertIn("imprej", task.skipped_columns, old)
+            notes = task.notes()
+            self.assertIn(f"{side} a fost recunoscută ca export eTerra, după sectorul cadastral "
+                          "necompletat al imobilelor ei.", notes)
+            self.assertIn("Fișierele unui export eTerra și ale unei livrări au nume diferite, "
+                          "deci perechile s-au găsit după IE. Potrivirea după IE urmărește și "
+                          "imobilele din eTerra dezmembrate.", notes)
+            self.assertEqual(self.facts(task)["Export eTerra"], side)
+        # the pieces of the split imobil are followed only by IE
+        self.assertEqual(len(task.deleted), 2)
+        self.assertEqual([o.key for o in task.added], ["numele 70003"])
+
+    def test_by_ie_the_report_names_the_source_taken_as_the_export(self):
+        for old, new, side in (("eterra", "livrare", "Sursa veche"),
+                               ("livrare", "eterra", "Sursa nouă")):
+            task = self.compare(old, new, mode=cc.IE, excel_path=self.folder("raport.xlsx"))
+            self.assertEqual((task.matched, task.split), (3, 1), old)
+            self.assertEqual(task.notes()[0], f"{side} a fost recunoscută ca export eTerra, "
+                             "după sectorul cadastral necompletat al imobilelor ei.")
+            self.assertEqual(self.facts(task)["Export eTerra"], side)
+            self.assertFalse(any("nume diferite" in note for note in task.notes()))
+
+    def test_by_file_name_an_export_file_pairs_only_with_the_imobil_that_holds_its_ie(self):
+        x = 500000
+        eterra, livrare = self.folder("eterra"), self.folder("livrare")
+        # the IE of one imobil is the cadastral number, and so the file name, of another
+        synthetic.write(eterra, "501.cgxml", Land(rings=[square(x + 400, 400000, 20)], ie="501",
+                                                  owners=("ALFA ION",), style="eterra"))
+        synthetic.write(livrare, "505.cgxml", delivery(505, [square(x + 400, 400000, 20)],
+                                                       ie="501", owner="ALFA ION"))
+        # the old cadastral number in eTerra is the number of another imobil in the delivery
+        synthetic.write(eterra, "70006.cgxml", Land(rings=[square(x + 500, 400000, 20)],
+                                                    ie="70006", cadgenno="502",
+                                                    owners=("BETA ANA",), style="eterra"))
+        synthetic.write(livrare, "506.cgxml", delivery(506, [square(x + 500, 400000, 20)],
+                                                       ie="70006", owner="BETA ANA"))
+        task = self.compare("eterra", "livrare", columns=["propr"])
+        self.assertEqual((task.matched, task.changed, task.unchanged), (4, [], 4))
+
+    def test_an_export_with_one_file_that_has_a_sector_is_recognised_as_the_export(self):
+        synthetic.write(self.folder("eterra"), "70002.cgxml", Land(
+            rings=[square(500100, 400000, 20)], ie="70002", legal_area=1250.37, sector="7",
+            style="eterra"))
+        task = self.compare("livrare", "eterra", mode=cc.IE, columns=["sup_acte"])
+        self.assertEqual(task.eterra_sides, [cc.NEW_SIDE])
+        self.assertEqual((task.matched, task.split, task.ignored), (3, 1, []))
+        self.assertEqual([cc.kind_of(o) for o in task.changed], ["Dezmembrat"])
+
+    def test_a_split_imobil_takes_its_fence_and_land_class_from_all_its_pieces(self):
+        x = 500000
+        eterra, livrare = self.folder("eterra"), self.folder("livrare")
+        synthetic.write(eterra, "70003.cgxml", Land(
+            rings=[square(x + 200, 400000, 20)], ie="70003", enclosed=True, style="eterra",
+            parcels=(("A", True), ("CC", False))))
+        synthetic.write(livrare, "503.cgxml", delivery(
+            503, [half(x + 200, 0)], ie="70003", enclosed=True, parcels=(("A", True),)))
+        synthetic.write(livrare, "504.cgxml", delivery(
+            504, [half(x + 200, 1)], ie="70003", enclosed=False, parcels=(("CC", False),)))
+        task = self.compare("eterra", "livrare", mode=cc.IE)
+        split = next(o for o in task.changed if o.key == "70003")
+        self.assertEqual(split.changes, [])
+        self.assertEqual(split.record["tip_teren"], "Mixt")
+        # no piece is fenced, and the whole lies outside the built-up area
+        for number, side, category in ((503, 0, "A"), (504, 1, "CC")):
+            synthetic.write(livrare, f"{number}.cgxml", delivery(
+                number, [half(x + 200, side)], ie="70003", enclosed=False,
+                parcels=((category, False),)))
+        task = self.compare("eterra", "livrare", mode=cc.IE)
+        split = next(o for o in task.changed if o.key == "70003")
+        self.assertEqual(split.changes, [("tip_teren", "Mixt", "Extravilan"),
+                                         ("imprej", "Da", "Nu")])
+
+    def test_a_person_named_on_every_piece_of_a_split_imobil_is_one_person(self):
+        x = 500000
+        eterra, livrare = self.folder("eterra"), self.folder("livrare")
+        synthetic.write(eterra, "70003.cgxml", Land(
+            rings=[square(x + 200, 400000, 20)], ie="70003", style="eterra",
+            owners=("POPESCU ION", "IONESCU ANA")))
+        synthetic.write(livrare, "503.cgxml", delivery(503, [half(x + 200, 0)], ie="70003",
+                                                       owner="POPESCU ION"))
+        synthetic.write(livrare, "504.cgxml", Land(
+            rings=[half(x + 200, 1)], cadgenno="504", ie="70003", sector="3",
+            owners=("POPESCU ION", "IONESCU ANA")))
+        task = self.compare("eterra", "livrare", mode=cc.IE, columns=["propr"])
+        self.assertEqual(next(o for o in task.changed if o.key == "70003").changes, [])
+
+    def test_a_measured_area_that_differs_by_a_move_within_the_precision_is_no_change(self):
+        x = 500000
+        eterra, livrare = self.folder("eterra"), self.folder("livrare")
+        # 9 mm along a side of 1 km are 9 mp
+        synthetic.write(eterra, "70009.cgxml", Land(
+            rings=[[(x, 401000), (x + 1000, 401000), (x + 1000, 401100), (x, 401100)]],
+            ie="70009", style="eterra"))
+        synthetic.write(livrare, "509.cgxml", delivery(
+            509, [[(x, 401000), (x + 1000, 401000), (x + 1000, 401100.009), (x, 401100.009)]],
+            ie="70009"))
+        task = self.compare("eterra", "livrare", mode=cc.IE, columns=["sup_mas"])
+        self.assertNotIn("70009", changes_of(task))
+        self.assertEqual(task.within_precision["imobile"], 1)
+        # an area that differs by more than the boundary moved is a change in the data
+        synthetic.write(livrare, "509.cgxml", delivery(
+            509, [[(x, 401000), (x + 1000, 401000), (x + 1000, 401100.009), (x, 401100.009)]],
+            ie="70009", measured_area=100500.0))
+        task = self.compare("eterra", "livrare", mode=cc.IE, columns=["sup_mas"])
+        self.assertEqual(changes_of(task)["70009"], [("sup_mas", 100000.0, 100500.0)])
+        self.assertEqual(cc.kind_of(task.changed[-1]), "Doar datele")
+
+
+class ValueRuleTests(SourceKindTest):
+    """Values of two deliveries compared by file name."""
+
+    def write_file(self, name, data):
+        """Write data as 1.cgxml in the folder of the source name."""
+        os.makedirs(self.folder(name), exist_ok=True)
+        with open(os.path.join(self.folder(name), "1.cgxml"), "wb") as fp:
+            fp.write(data)
+
+    def test_losing_one_of_two_owners_who_share_a_name_is_a_change(self):
+        ring = square(500000, 400000, 20)
+        two = synthetic.cgxml_bytes(Land(rings=[ring], cadgenno="1", sector="3",
+                                         owners=("POPESCU ION", "POPESCU ION")))
+        # two persons: the placeholder identity code of each replaced by a code of their own
+        for code in (b"1500101123456", b"1800202123456"):
+            two = two.replace(b"<IDCODE>9999999999999</IDCODE>", b"<IDCODE>" + code + b"</IDCODE>",
+                              1)
+        self.write_file("v1", two)
+        self.write_file("v2", synthetic.cgxml_bytes(delivery(1, [ring])))
+        task = self.compare("v1", "v2", columns=["propr"])
+        self.assertEqual(changes_of(task),
+                         {"1": [("propr", "POPESCU ION, POPESCU ION", "POPESCU ION")]})
+        # the same two owners listed in another order are no change
+        self.assertFalse(compare_service.values_differ("A, B, A", "A, A, B", column="propr"))
+
+    def test_s_and_t_with_a_cedilla_are_the_letters_with_a_comma_below(self):
+        ring = square(500000, 400000, 20)
+        self.write_file("v1", synthetic.cgxml_bytes(delivery(
+            1, [ring], owner="\u015eTEFAN \u0162U\u0162EA", street="Mare\u015fal Averescu")))
+        self.write_file("v2", synthetic.cgxml_bytes(delivery(
+            1, [ring], owner="ȘTEFAN ȚUȚEA", street="Mareșal Averescu")))
+        task = self.compare("v1", "v2")
+        self.assertEqual((task.changed, task.unchanged), ([], 1))
+        # letter case and a missing diacritic are differences unless the option is on
+        self.assertTrue(compare_service.values_differ("\u015etefan", "\u0218TEFAN"))
+        self.assertTrue(compare_service.values_differ("\u015etefan", "Stefan"))
 
 
 def tearDownModule():

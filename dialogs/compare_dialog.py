@@ -4,7 +4,6 @@
 """Comparator window: two layers or two sets of CGXML files."""
 
 import json
-import os
 
 from qgis.PyQt.QtWidgets import (  # type: ignore
     QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
@@ -105,6 +104,8 @@ class CompareDialog(BaseDialog):
         self._key_layers = {"old": None, "new": None}
         # {layer id: its key column, renamed or deleted while the window is open}
         self._lost_keys = {}
+        # LayerPlan.imobil_column of the chosen imobile layers and their keys
+        self._imobil_column = "id"
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel(self.tr("Se compară:")))
         self.mode = SegmentedControl(
@@ -131,7 +132,8 @@ class CompareDialog(BaseDialog):
         self.compare_geometry.setToolTip(self.tr(
             "Un imobil cu aceleași atribute, dar cu limita mutată, apare la 'Modificate'. "
             "Limita se consideră mutată când suprafața dintre limita veche și cea nouă, sau "
-            "diferența de suprafață, depășește toleranța."))
+            "diferența de suprafață, depășește toleranța. Punctele și liniile se compară după "
+            "distanță: se consideră mutate când se abat cu peste 1 mm."))
         geom_line.addWidget(self.compare_geometry)
         self.tolerance = QDoubleSpinBox()
         self.tolerance.setRange(0.0, 10000.0)
@@ -148,8 +150,9 @@ class CompareDialog(BaseDialog):
         criteria_layout.addWidget(self.buildings)
         self.fold_text = QCheckBox(self.tr("Ignoră majusculele și diacriticele"))
         self.fold_text.setToolTip(self.tr(
-            "Cu bifa pusă, 'Ştefan' și 'ȘTEFAN' sunt aceeași valoare. Spațiile de la "
-            "capete și cele duble nu contează niciodată."))
+            "Cu bifa pusă, 'Ștefan' și 'STEFAN' sunt aceeași valoare. Spațiile de la capete "
+            "și cele duble nu contează niciodată. Literele ș și ț sunt aceleași scrise cu "
+            "virgulă sau cu sedilă, cu sau fără bifă."))
         criteria_layout.addWidget(self.fold_text)
         # each mode has its own setting, shown in fold_text; matching by IE is mostly an eTerra
         # export against a delivery, typed by different people, so there it starts ticked
@@ -166,7 +169,8 @@ class CompareDialog(BaseDialog):
         self.excel_row.edit.setPlaceholderText(self.tr("Opțional"))
         out_form.addRow(self.tr("Raport Excel:"), self.excel_row)
         # each mode keeps its own report path, so one mode's run never offers to overwrite
-        # the other's report; the field shows the current mode's
+        # the other's report; the field shows the current mode's. These line edits are never
+        # shown: they hold each mode's path as typed, with or without quotes
         self._excel_paths = {LAYERS: QLineEdit(), CGXML: QLineEdit()}
         self._excel_mode = None
         boxes = QHBoxLayout()
@@ -213,8 +217,8 @@ class CompareDialog(BaseDialog):
         # fold_text and the report field
         for kind, store in self._fold_by_kind.items():
             self.remember(f"fold_{kind}", store)
-        self.remember("excel_layers", self._excel_paths[LAYERS])
-        self.remember("excel_cgxml", self._excel_paths[CGXML])
+        self.remember("excel_layers", self._excel_paths[LAYERS], per_project=True)
+        self.remember("excel_cgxml", self._excel_paths[CGXML], per_project=True)
         self.remember("mode", self.mode)
         self.remember("compare_geometry", self.compare_geometry)
         self.remember("tolerance", self.tolerance)
@@ -222,8 +226,8 @@ class CompareDialog(BaseDialog):
         self.remember("layer_added", self.layer_added)
         self.remember("layer_deleted", self.layer_deleted)
         self.remember("layer_changed", self.layer_changed)
-        self.remember("old_cgxml", self.old_source.edit)
-        self.remember("new_cgxml", self.new_source.edit)
+        self.remember("old_cgxml", self.old_source.edit, per_project=True)
+        self.remember("new_cgxml", self.new_source.edit, per_project=True)
         self.remember("old_recursive", self.old_source.recursive)
         self.remember("new_recursive", self.new_source.recursive)
         self.remember("match", self.match_combo)
@@ -395,21 +399,22 @@ class CompareDialog(BaseDialog):
     def _preselect_buildings(self):
         """Take the construcții layers converted with the chosen imobile layers. Until the
         user ticks or unticks the section, it is ticked only when both are found and can be
-        paired: with an eTerra export by the IE of their imobil, since its cadastral numbers
-        are not the IDs of a delivery."""
+        paired as their imobile are (compare_service.building_plan): by the IE of their
+        imobil when the imobile pair on their IE, as with an eTerra export, whose cadastral
+        numbers are not the IDs of a delivery."""
         found = {side: self._converted_buildings(combo.currentLayer())
                  for side, combo in (("old", self.old_combo), ("new", self.new_combo))}
-        eterra = any(cgxml_compare.is_eterra_export(combo.currentLayer())
-                     for combo in (self.old_combo, self.new_combo))
-        imobil_key = "ie_imobil" if eterra else "id"
-        usable = (all(found.values()) and found["old"] is not found["new"]
-                  and all(roles.column_of(layer, imobil_key) for layer in found.values()))
+        usable = all(found.values()) and found["old"] is not found["new"]
+        if usable:
+            plan = compare_service.building_plan(found["old"], found["new"],
+                                                 imobil_column=self._imobil_column)
+            keys = {"old": plan.key_old, "new": plan.key_new}
+            usable = all(keys["old"]) and all(keys["new"])
         if usable:
             for side, layer in found.items():
                 self.building_combos[side].setLayer(layer)
-                imobil, number = self.building_keys[side]
-                for combo_box, key in ((imobil, imobil_key), (number, "nr_constr")):
-                    index = combo_box.findData(roles.column_of(layer, key))
+                for combo_box, key in zip(self.building_keys[side], keys[side]):
+                    index = combo_box.findData(key)
                     if index >= 0:
                         combo_box.setCurrentIndex(index)
         if not self._buildings_chosen:
@@ -440,12 +445,11 @@ class CompareDialog(BaseDialog):
         if old is None or new is None:
             self.building_fields.set_names([])
             return
-        keys = set((self._building_key("old") or []) + (self._building_key("new") or []))
-        new_names = set(data_field_names([new]))
-        chosen = cgxml_compare.converted_columns(old, new, cgxml_compare.BUILDING_COLUMNS)
-        self.building_fields.set_names(
-            [name for name in data_field_names([old]) if name in new_names and name not in keys],
-            True if chosen is None else chosen)
+        plan = compare_service.building_plan(
+            old, new, imobil_column=self._imobil_column,
+            keys=[tuple(combo.currentData() for combo in self.building_keys[side])
+                  for side in ("old", "new")])
+        self.building_fields.set_names(plan.columns, set(plan.ticked))
 
     def _follow_fields(self, name, layers, slot):
         """Call slot when the fields of one of layers change, replacing the layers followed
@@ -635,7 +639,7 @@ class CompareDialog(BaseDialog):
 
     def _keys_for(self, old, new):
         """The key columns of two layers: those picked by hand while one of the layers they
-        were picked for is chosen, else compare_service.key_columns()."""
+        were picked for is chosen, else those of compare_service.layer_plan()."""
         chosen = {layer.id() for layer in (old, new) if layer is not None}
         if self._key_choice is not None:
             layers, key_old, key_new = self._key_choice
@@ -644,7 +648,8 @@ class CompareDialog(BaseDialog):
             self._key_choice = None
         if old is None or new is None:
             return None, None
-        return compare_service.key_columns(old, new)
+        plan = compare_service.layer_plan(old, new)
+        return plan.key_old, plan.key_new
 
     def _on_key_chosen(self, *_args):
         layers = {layer.id() for layer in (self.old_combo.currentLayer(),
@@ -669,16 +674,15 @@ class CompareDialog(BaseDialog):
                                          .format(key_old, key_new))
         else:
             self.key_hint.set_status("")
-        self.eterra_hint.set_status(self.tr(cgxml_compare.eterra_advice(old, new)), "info")
         if not old or not new:
+            self._imobil_column = "id"
+            self.eterra_hint.set_status("", "info")
             self.field_list.set_names([])
             return
-        new_names = set(data_field_names([new]))
-        chosen = cgxml_compare.converted_columns(old, new, cgxml_compare.DEFAULT_COLUMNS)
-        self.field_list.set_names(
-            [name for name in data_field_names([old])
-             if name in new_names and name not in (key_old, key_new)],
-            True if chosen is None else chosen)
+        plan = compare_service.layer_plan(old, new, keys=(key_old, key_new))
+        self._imobil_column = plan.imobil_column
+        self.eterra_hint.set_status(self.tr(plan.advice), "info")
+        self.field_list.set_names(plan.columns, set(plan.ticked))
 
     # --- run ---
 
@@ -773,28 +777,11 @@ class CompareDialog(BaseDialog):
             return []
         return [old.currentLayer(), new.currentLayer()]
 
-    def _source_ok(self, source, which):
-        paths = source.paths()
-        if not paths or not all(os.path.exists(p) for p in paths):
-            self.warn(self.tr("Alegeți {0}: un folder, o arhivă ZIP sau fișiere .cgxml.")
-                      .format(which), source.edit)
-            return False
-        source.refresh()
-        count = source.count()
-        if count is None:
-            # part of the source cannot be read, and the status line under the field names it
-            self.warn(self.tr("{0} nu poate fi folosită. {1}").format(
-                which[:1].upper() + which[1:], source.status.text()), source.edit)
-            return False
-        if not count:
-            self.warn(self.tr("Nu s-a găsit niciun fișier .cgxml în {0}.").format(which),
-                      source.edit)
-            return False
-        return True
-
     def _run_cgxml(self):
-        if not self._source_ok(self.old_source, self.tr("sursa veche")) or \
-                not self._source_ok(self.new_source, self.tr("sursa nouă")):
+        # a part of a source left unread would show its imobile as added or removed
+        if not self.sources_ready([(self.old_source, self.tr("sursa veche")),
+                                   (self.new_source, self.tr("sursa nouă"))],
+                                  self._run, whole=True):
             return
         columns = self.cgxml_fields.checked_data()
         if not columns and not self.compare_geometry.isChecked():
@@ -846,8 +833,8 @@ class CompareDialog(BaseDialog):
             layers += self._result_layers(
                 b, (self.tr("Construcții apărute [{0}]"), self.tr("Construcții dispărute [{0}]"),
                     self.tr("Construcții modificate [{0}]")), unwritten)
-        _ui_helpers.add_layers(layers, self.tr("Comparator: {0} și {1}")
-                               .format(task.old.name, task.new.name))
+        layers = _ui_helpers.add_layers(layers, self.tr("Comparator: {0} și {1}")
+                                        .format(task.old.name, task.new.name))
 
         records = (self.tr("înregistrare"), self.tr("înregistrări"))
         headline = self.tr("Layerul vechi are {0}, cel nou {1}.").format(
@@ -875,7 +862,9 @@ class CompareDialog(BaseDialog):
                                                self.tr("construcții, nou"))
             layer_names += [b.old, b.new]
         report = self.report_notes(task)
-        notes = (warnings + unwritten + report + stereo70.notes(layer_names)
+        by_distance = [self.tr(compared.geometry_note()) for compared in (task, b)
+                       if compared is not None and compared.geometry_note()]
+        notes = (warnings + unwritten + report + by_distance + stereo70.notes(layer_names)
                  + self._created_note(layers))
         self.show_result(headline, counts=counts, notes=notes,
                          file_path=None if report else task.excel_path or None,
@@ -987,7 +976,7 @@ class CompareDialog(BaseDialog):
             left_out.append((name, result.left_out))
             if result.features:
                 layers.append(self._result_layer(result, name, color, unwritten))
-        _ui_helpers.add_layers(layers, self.tr("Comparator CGXML"))
+        layers = _ui_helpers.add_layers(layers, self.tr("Comparator CGXML"))
 
         counts = [(self.tr(label), value, CGXML_COLORS.get(label.strip()))
                   for label, value in task.summary_rows()]
@@ -1007,13 +996,7 @@ class CompareDialog(BaseDialog):
         report = self.report_notes(task)
         notes = task.notes()
         if task.renamed:
-            notes.append(fmt.plural(
-                task.renamed,
-                self.tr("{0} are alt nume de fișier în sursa nouă și a fost găsit după IE "
-                        "sau după numărul cadastral."),
-                self.tr("{0} au alt nume de fișier în sursa nouă și au fost găsite după IE "
-                        "sau după numărul cadastral.")).format(
-                fmt.count(task.renamed, self.tr("imobil"), self.tr("imobile"))))
+            notes.append(self.tr(task.renamed_text()))
         if task.ignored:
             notes.append(fmt.plural(
                 len(task.ignored), self.tr("{0} a fost ignorat; motivul este în detalii."),
@@ -1038,3 +1021,15 @@ class CompareDialog(BaseDialog):
         self.show_result(headline, counts=counts, notes=notes,
                          file_path=None if report else task.excel_path,
                          details=details or None, warning=warning, layers=layers)
+
+    def project_changed(self):
+        super().project_changed()
+        self._layers_chosen = False
+        self._buildings_chosen = False
+        self._key_choice = None
+        self._preselect_versions()
+        # refill the construcții column boxes, which super() emptied
+        self._refresh_building_fields()
+        # the report field takes the path kept for this project and the current mode
+        self._excel_mode = None
+        self._on_mode_changed()

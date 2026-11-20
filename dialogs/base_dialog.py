@@ -5,6 +5,7 @@
 remembered values."""
 
 import html
+import json
 import os
 import time
 import traceback
@@ -14,8 +15,9 @@ from qgis.PyQt.QtCore import (  # type: ignore
     QEvent, QObject, QSettings, QSize, Qt, QTimer, pyqtSignal,
 )
 from qgis.PyQt.QtWidgets import (  # type: ignore
-    QAbstractSpinBox, QApplication, QComboBox, QDialog, QDialogButtonBox, QFrame, QHBoxLayout,
-    QLabel, QProgressBar, QPushButton, QSizePolicy, QStackedWidget, QTabWidget, QToolButton,
+    QAbstractButton, QAbstractItemView, QAbstractSpinBox, QApplication, QComboBox, QDialog,
+    QDialogButtonBox, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QProgressBar, QPushButton, QSizePolicy, QStackedWidget, QTabWidget, QToolButton,
     QVBoxLayout, QWidget,
 )
 from qgis.core import Qgis, QgsApplication, QgsProject, QgsVectorLayer  # type: ignore
@@ -24,7 +26,10 @@ from qgis.gui import (  # type: ignore
 )
 
 from . import _ui_helpers, theme
-from .widgets import LayerChecklist, link_label
+from .widgets import (
+    POLL_MS, CgxmlSource, CheckList, LayerChecklist, PathEdit, PathRow, forget_field_choices,
+    link_label,
+)
 from .. import features
 from ..i18n import tr as _tr
 from ..services import dialog_memory, fmt, layer_sources, outputs, stereo70
@@ -34,6 +39,9 @@ WARNING_DURATION = 10
 # the most of the screen height a dialog takes before its body scrolls
 SCREEN_SHARE = 0.9
 MARGIN = 16
+# the widgets a label can name and give the keyboard focus to; not a button, which the
+# mnemonic of its label would press
+INPUTS = (QLineEdit, QComboBox, QAbstractSpinBox, QAbstractItemView)
 
 
 def _feature(method):
@@ -55,6 +63,42 @@ def hairline() -> QFrame:
     line = QFrame()
     line.setObjectName("cadexHairline")
     return line
+
+
+def _plain(text) -> str:
+    """A label's text as a name: without its mnemonic mark and its closing colon."""
+    return (text or "").replace("&", "").strip().rstrip(":").strip()
+
+
+def _first_input(item):
+    """The first widget that takes input in a layout item, None when it holds none."""
+    widget = item.widget()
+    if widget is not None:
+        if isinstance(widget, (PathRow, CgxmlSource)):
+            return widget.edit
+        if isinstance(widget, INPUTS):
+            return widget
+        return next(iter(widget.findChildren(INPUTS)), None)
+    layout = item.layout()
+    for i in range(layout.count() if layout is not None else 0):
+        found = _first_input(layout.itemAt(i))
+        if found is not None:
+            return found
+    return None
+
+
+def _with_mnemonic(text, used) -> str:
+    """text with '&' before its first letter that no other mnemonic of the window uses, a
+    first letter of a word when one is free; text itself when every letter is taken. Only
+    a to z: the keys of ă, î, ș and ț differ between keyboard layouts. used is updated."""
+    def free(i):
+        return text[i].isascii() and text[i].isalpha() and text[i].lower() not in used
+    starts = [i for i in range(len(text)) if i == 0 or not text[i - 1].isalnum()]
+    for i in starts + list(range(len(text))):
+        if free(i):
+            used.add(text[i].lower())
+            return text[:i] + "&" + text[i:]
+    return text
 
 
 def screen_of(window):
@@ -177,13 +221,28 @@ class BaseDialog(QDialog):
         self._processing = False
         self._remembered = []
         self._task = None
+        # the project was closed or replaced while the task ran: its results stay out of the
+        # project open when it ends
+        self._project_replaced = False
+        # while the finished callback of such a run is called: the layers it passed to
+        # _ui_helpers.add_layers(), one list per call; None for a run in its own project
+        self._withheld = None
+        # a run that waits for the files of its CGXML sources to be counted: (the sources,
+        # the call that runs it); None when no run waits
+        self._awaited = None
+        # while _check_counts() calls the run again: the sources just counted, which
+        # _sources_counted() must not count again
+        self._just_counted = ()
         self._run_message = ""
         self._started = 0.0
         self._run_btn = None
         self._close_btn = None
         self._help_owned = None
+        self._header_icon = None
+        self._labelled = False
 
         feature = _feature(self.FEATURE) if self.FEATURE else None
+        self._feature = feature
         if feature is not None:
             self.setWindowTitle(self.tr(feature.label).rstrip("."))
             self.setWindowIcon(_ui_helpers.plugin_icon(feature.icon))
@@ -233,6 +292,15 @@ class BaseDialog(QDialog):
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._show_progress_text)
+        self._count_timer = QTimer(self)
+        self._count_timer.setInterval(POLL_MS)
+        self._count_timer.timeout.connect(self._check_counts)
+
+        # connected before this window's own slots, so dialog_memory drops the values of the
+        # project just closed before the window restores its own for the new project
+        dialog_memory.watch_project()
+        for signal in self._project_signals():
+            signal.connect(self._on_project_replaced)
 
     # --- frame ---
 
@@ -242,8 +310,9 @@ class BaseDialog(QDialog):
         row.setContentsMargins(MARGIN, 12, 10, 10)
         row.setSpacing(12)
         icon = QLabel()
-        icon.setPixmap(_ui_helpers.plugin_icon(feature.icon).pixmap(36, 36))
+        icon.setPixmap(_ui_helpers.icon_pixmap(_ui_helpers.plugin_icon(feature.icon), 36))
         row.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
+        self._header_icon = icon
         texts = QVBoxLayout()
         texts.setSpacing(3)
         title = QLabel(self.tr(feature.label).rstrip("."))
@@ -336,17 +405,60 @@ class BaseDialog(QDialog):
             except RuntimeError:
                 pass
             self._task = None
+        self._awaited = None
+        self._count_timer.stop()
         self._processing = False
         self._timer.stop()
+        for signal in self._project_signals():
+            try:
+                signal.disconnect(self._on_project_replaced)
+            except (TypeError, RuntimeError):
+                pass
         for checklist in self.findChildren(LayerChecklist):
             checklist.disconnect_project()
         self.hide()
         self.deleteLater()
 
+    # --- the project ---
+
+    @staticmethod
+    def _project_signals():
+        project = QgsProject.instance()
+        return project.cleared, project.readProject
+
+    def _on_project_replaced(self, *_args):
+        try:
+            if self._task is not None:
+                self._project_replaced = True
+            if self._awaited is not None:
+                # the run was asked for in the project that closed
+                self._end_wait()
+                self.notice(self.tr(
+                    "Rularea nu a pornit, deoarece proiectul s-a schimbat între timp."))
+            self.project_changed()
+        except RuntimeError:
+            pass  # the window is being destroyed
+
+    def project_changed(self):
+        """Called when the project is closed and when another one has been read, whether the
+        window is shown or not. What the user chose for the layers of the previous project
+        does not apply to this one: field combo boxes and ticked lists return to their
+        preselection, and the fields kept per project take the values of the open project, or
+        none. A window resets its own choices in an override, which calls this one first."""
+        forget_field_choices(self)
+        for checklist in self.findChildren(CheckList):
+            checklist.forget_choices()
+        for key, widget, column, per_project in self._remembered:
+            self._restore(key, widget, column, per_project, replaced=True)
+
     # --- window ---
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._follow_palette()
+        if not self._labelled:
+            self._labelled = True
+            self._label_inputs()
         if self._wheel_guard is not None:
             self._wheel_guard.guard(self._body_widget)
         geom = QSettings().value(self._geometry_key)
@@ -373,17 +485,99 @@ class BaseDialog(QDialog):
         super().done(result)
 
     def reject(self):
-        # Escape is ignored while a task runs
+        # Escape closes nothing while a task runs
         if self._processing:
+            self._show_running()
             return
         super().reject()
 
     def closeEvent(self, event):
         if self._processing:
             event.ignore()
+            self._show_running()
             return
         self._save_geometry()
         super().closeEvent(event)
+
+    def _show_running(self):
+        self._push_message("", self.tr(
+            "Fereastra nu se închide cât timp rularea este în curs. Rularea se poate anula "
+            "cu butonul 'Anulează'."), Qgis.MessageLevel.Info, WARNING_DURATION)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # a hidden window is restyled when it is shown
+        if event.type() == QEvent.Type.PaletteChange and self.isVisible():
+            self._follow_palette()
+
+    def _follow_palette(self):
+        """Take the colors and icon variants of the palette in use: the QGIS theme and, on
+        Qt6, the system's light or dark mode can change while the window exists."""
+        tokens = theme.tokens()
+        if tokens == self.tokens:
+            return
+        self.tokens = tokens
+        self.setStyleSheet(theme.dialog_stylesheet(self.tokens))
+        self._set_icons()
+
+    def _set_icons(self):
+        """Set the icons that have a light and a dark variant."""
+        if self._feature is None:
+            return
+        icon = _ui_helpers.plugin_icon(self._feature.icon)
+        self.setWindowIcon(icon)
+        if self._header_icon is not None:
+            self._header_icon.setPixmap(_ui_helpers.icon_pixmap(icon, 36))
+
+    def _label_inputs(self):
+        """Name the inputs for screen readers and give the run and close buttons and the
+        form labels a mnemonic, each letter once in the window. A form label names the first
+        input of its row and becomes its buddy; an input of a grid is named after the labels
+        that head its row and its column; a button showing only an icon, after its tooltip."""
+        labels = []
+        for form in self.findChildren(QFormLayout):
+            for row in range(form.rowCount()):
+                label_item = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+                field_item = form.itemAt(row, QFormLayout.ItemRole.FieldRole)
+                label = label_item.widget() if label_item is not None else None
+                if not isinstance(label, QLabel) or not _plain(label.text()) \
+                        or field_item is None:
+                    continue
+                target = _first_input(field_item)
+                if target is None:
+                    continue
+                label.setBuddy(target)
+                labels.append(label)
+                if isinstance(target, PathEdit) or not target.accessibleName():
+                    target.setAccessibleName(_plain(label.text()))
+        for grid in self.findChildren(QGridLayout):
+            self._name_grid(grid)
+        for button in self.findChildren(QAbstractButton):
+            if not button.accessibleName() and button.toolTip() \
+                    and not any(c.isalnum() for c in button.text()):
+                button.setAccessibleName(button.toolTip())
+        buttons = [button for button in self.button_box.buttons()
+                   if button is self._close_btn or button.objectName() == "cadexPrimary"]
+        used = set()
+        for widget in buttons + labels:
+            if "&" not in widget.text():
+                widget.setText(_with_mnemonic(widget.text(), used))
+
+    @staticmethod
+    def _name_grid(grid):
+        def text_at(row, column):
+            item = grid.itemAtPosition(row, column)
+            widget = item.widget() if item is not None else None
+            return _plain(widget.text()) if isinstance(widget, QLabel) else ""
+
+        for row in range(1, grid.rowCount()):
+            for column in range(1, grid.columnCount()):
+                item = grid.itemAtPosition(row, column)
+                widget = item.widget() if item is not None else None
+                if isinstance(widget, INPUTS) and not widget.accessibleName():
+                    name = ", ".join(t for t in (text_at(row, 0), text_at(0, column)) if t)
+                    if name:
+                        widget.setAccessibleName(name)
 
     def fit_height(self):
         """Resize to the content's height at the current width, at most SCREEN_SHARE of the
@@ -405,32 +599,90 @@ class BaseDialog(QDialog):
 
     # --- remembered widget values ---
 
-    def remember(self, key: str, widget, by_text: bool = False):
-        """Keep the widget's value between sessions. by_text stores a combo box's text instead
-        of its index, for lists filled with field names."""
-        self._remembered.append((key, widget, by_text))
+    def remember(self, key: str, widget, column: bool = False, per_project: bool = False):
+        """Keep the widget's value between sessions, for the QGIS profile or, with
+        per_project, for the project it was used in (dialog_memory), as a path is. column is
+        for a combo box filled with field names: its column is kept for the project, and only
+        as the user's choice, never as the preselection."""
+        self._remembered.append((key, widget, column, per_project))
 
     def restore_remembered(self):
         """Apply the stored values; call once the combo boxes and lists are filled."""
+        for key, widget, column, per_project in self._remembered:
+            self._restore(key, widget, column, per_project)
+
+    def _restore(self, key, widget, column, per_project, replaced=False):
+        """Apply the stored value of one widget. replaced is true when the project has just
+        been replaced: only what is kept per project is applied then, and a path of the
+        previous project is emptied when this one has none."""
         name = type(self).__name__
-        for key, widget, by_text in self._remembered:
-            stored = dialog_memory.load(name, key)
-            if stored is None:
-                continue
-            try:
-                _ui_helpers.apply_widget_state(widget, stored, by_text)
-            except (TypeError, ValueError, RuntimeError):
-                pass  # stored value does not fit this widget
+        try:
+            if column:
+                self._restore_column(name, key, widget)
+            elif per_project:
+                self._restore_text(name, key, widget, replaced)
+            elif not replaced:
+                stored = dialog_memory.load(name, key)
+                if stored is not None:
+                    _ui_helpers.apply_widget_state(widget, stored)
+        except (TypeError, ValueError, RuntimeError):
+            pass  # stored value does not fit this widget
+
+    @staticmethod
+    def _restore_column(name, key, combo):
+        # a box not filled yet may still be set to take the column chosen in the project
+        # just closed
+        combo.setProperty(_ui_helpers.WANTED_PROPERTY, None)
+        stored = dialog_memory.load(name, key, project=True)
+        if stored is not None:
+            choice = json.loads(str(stored))
+            if isinstance(choice, dict) and choice.get("chosen"):
+                _ui_helpers.choose_field(combo, str(choice.get("data") or ""))
+            return
+        # CADex 0.2.0 stored the text shown, for the whole profile, preselections included, so
+        # only an entry that names a column counts as a choice
+        text = dialog_memory.load(name, key)
+        index = combo.findText(str(text)) if text is not None else -1
+        if index >= 0 and combo.itemData(index):
+            _ui_helpers.choose_field(combo, combo.itemData(index))
+
+    @staticmethod
+    def _restore_text(name, key, edit, replaced):
+        # the path CADex 0.2.0 stored for the whole profile is not offered in any project
+        text = dialog_memory.load(name, key, project=True)
+        if text is None:
+            if not replaced:
+                return
+            text = ""
+        if edit.text() == str(text):
+            return
+        edit.setText(str(text))
+        source = edit.parentWidget()
+        if replaced and isinstance(source, CgxmlSource):
+            source.refresh()
 
     def save_remembered(self):
-        """Store the current values; called when the tool runs, not when the window closes."""
+        """Store the current values; called when the tool runs, not when the window closes.
+        A value stored for the project removes the one that settings written by CADex 0.2.0
+        hold for the profile."""
         name = type(self).__name__
-        for key, widget, by_text in self._remembered:
+        for key, widget, column, per_project in self._remembered:
             try:
-                value = _ui_helpers.read_widget_state(widget, by_text)
+                if column:
+                    data, chosen = _ui_helpers.field_choice(widget)
+                    dialog_memory.save(name, key, json.dumps({"data": data, "chosen": chosen}),
+                                       project=True)
+                    dialog_memory.remove(name, key)
+                    continue
+                value = _ui_helpers.read_widget_state(widget)
             except RuntimeError:
                 continue
-            if value is not None:
+            if value is None:
+                continue
+            if per_project:
+                dialog_memory.save(name, key, value, project=True)
+                dialog_memory.remove(name, key)
+            else:
                 dialog_memory.save(name, key, value)
 
     # --- messages ---
@@ -444,9 +696,25 @@ class BaseDialog(QDialog):
     def show_result(self, headline: str, *, counts=(), notes=(),
                     file_path: Optional[str] = None, details: Optional[str] = None,
                     warning: bool = False, layers=()):
+        if self._withheld is not None:
+            notes, layers, warning = self._notes_without_layers(notes, file_path), (), True
         _ui_helpers.show_result(self, self.windowTitle(), headline, counts=counts,
                                 notes=notes, file_path=file_path, details=details,
                                 warning=warning, layers=layers, iface=self.iface)
+
+    def _notes_without_layers(self, notes, file_path) -> list:
+        """The notes of a run whose project was closed before it ended: first that the
+        project changed and which results stayed out of the project open now, then notes.
+        add_layers() returned no layer to the run, so notes name none."""
+        held = sum(len(layers) for layers in self._withheld)
+        text = self.tr("Proiectul s-a schimbat în timpul rulării.")
+        if held:
+            text += " " + fmt.plural(held, self.tr(
+                "Layerul rezultat nu a fost adăugat în proiectul deschis acum."), self.tr(
+                "Layerele rezultate nu au fost adăugate în proiectul deschis acum."))
+        if file_path:
+            text += " " + self.tr("Fișierele scrise au rămas la locul lor.")
+        return [text] + list(notes)
 
     @staticmethod
     def report_notes(task) -> list:
@@ -591,7 +859,8 @@ class BaseDialog(QDialog):
         existing = [p for p in paths if p and os.path.exists(p)]
         if not existing:
             return True
-        names = ", ".join(os.path.basename(p) for p in existing)
+        # with the folder: the reports of two projects often have the same name
+        names = ", ".join(f"'{os.path.normpath(p)}'" for p in existing)
         if len(existing) == 1:
             question = self.tr("Fișierul {0} există deja. Doriți să fie înlocuit?")
         else:
@@ -629,6 +898,101 @@ class BaseDialog(QDialog):
             label(first, second), label(second, first), field, sample),
             self.tr("Continuă cu ambele"), self.tr("Anulează"))
 
+    # --- the files of a run's CGXML sources ---
+
+    def sources_ready(self, named, again, whole=False) -> bool:
+        """True when each CgxmlSource of named, [(source, its name in a warning, or "" for
+        the window's only source)], is counted and has .cgxml files to read, in every part of
+        it with whole. Otherwise False: after a warning on the first source that falls short,
+        or while the window waits for the counts, after which again() is called."""
+        for source, name in named:
+            if not source.paths():
+                self.warn(self._choose_source(name), source.edit)
+                return False
+        if not self._sources_counted([source for source, _name in named], again, whole):
+            return False
+        for source, name in named:
+            found, problem, unreadable = source.outcome()
+            if problem == "missing":
+                self.warn(self._choose_source(name), source.edit)
+                return False
+            if problem and (whole or not found):
+                self.warn(self._unreadable_source(source, name, found, unreadable),
+                          source.edit)
+                return False
+            if not found:
+                self.warn(self.tr("Nu s-a găsit niciun fișier .cgxml în {0}.").format(
+                    name or self.tr("sursa aleasă")), source.edit)
+                return False
+        return True
+
+    def _choose_source(self, name) -> str:
+        if not name:
+            return self.tr("Alegeți folderul, arhiva ZIP sau fișierele CGXML.")
+        return self.tr("Alegeți {0}: un folder, o arhivă ZIP sau fișiere .cgxml.").format(name)
+
+    def _unreadable_source(self, source, name, found, unreadable) -> str:
+        if not unreadable:
+            # the count holds no reason for the part; the status line under the field names it
+            return source.status.text()
+        subject = name or self.tr("sursa aleasă")
+        subject = subject[:1].upper() + subject[1:]
+        if found:
+            return self.tr("{0} nu poate fi citită în întregime: {1}.").format(
+                subject, unreadable)
+        return self.tr("{0} nu poate fi citită: {1}.").format(subject, unreadable)
+
+    def _sources_counted(self, sources, again, whole) -> bool:
+        """True when every CgxmlSource in sources has a finished count of its current text,
+        so the run reads CgxmlSource.outcome() and makes no file system call: one on a
+        network drive out of reach blocks for tens of seconds.
+
+        Otherwise starts the counts that are missing, and a new count of a source whose last
+        count found no file or, with whole, a part that cannot be read, since the user may
+        have fixed it since; disables the window as for a task, with the Anulează button, and
+        returns False. again() is called once every count is in, unless the wait is canceled
+        or the project is replaced."""
+        for source in sources:
+            if source.counted() and source not in self._just_counted \
+                    and not self._has_files(source, whole):
+                source.refresh()
+        # a list, so that every count not started yet starts now
+        if all([source.counted() for source in sources]):
+            return True
+        self._awaited = (list(sources), again)
+        self._run_message = self.tr("Se caută fișierele...")
+        self._started = time.monotonic()
+        self.message_bar.clearWidgets()
+        self._set_running(True, busy=True)
+        self._count_timer.start()
+        return False
+
+    @staticmethod
+    def _has_files(source, whole) -> bool:
+        files, problem, _unreadable = source.outcome()
+        return files > 0 and not (whole and problem)
+
+    def _check_counts(self):
+        """Call what waits for the counts once they are all in. The window is disabled during
+        the wait, so the sources keep the text the run was asked for."""
+        if self._awaited is None:
+            self._count_timer.stop()
+            return
+        sources, again = self._awaited
+        if not all([source.counted() for source in sources]):
+            return
+        self._end_wait()
+        self._just_counted = tuple(sources)
+        try:
+            again()
+        finally:
+            self._just_counted = ()
+
+    def _end_wait(self):
+        self._awaited = None
+        self._count_timer.stop()
+        self._set_running(False)
+
     # --- background tasks ---
 
     def start_task(self, task, message: str = ""):
@@ -636,6 +1000,7 @@ class BaseDialog(QDialog):
         until it finishes. The dialog keeps the task until task_done(), so cancel_task() and
         dispose() can reach it while it runs."""
         self._task = task
+        self._project_replaced = False
         self._run_message = message
         self._started = time.monotonic()
         task.progressChanged.connect(self._on_task_progress)
@@ -646,11 +1011,17 @@ class BaseDialog(QDialog):
 
     def _guarded(self, callback):
         """Wrap the finished callback so an exception while showing results is reported as a
-        failed run. The callback runs on the main thread, outside the task's own try/except."""
+        failed run. The callback runs on the main thread, outside the task's own try/except.
+
+        A task belongs to the project it started in. When that project was closed meanwhile,
+        the callback runs with _ui_helpers.add_layers() adding nothing to the open project,
+        and show_result() adds a note on it; what the run wrote to files stays."""
         if callback is None:
             return None
 
         def guarded(ok, task):
+            self._withheld = [] if self._project_replaced else None
+            previous = _ui_helpers.withhold(self._withheld)
             try:
                 callback(ok, task)
             except Exception as error:
@@ -660,10 +1031,19 @@ class BaseDialog(QDialog):
                     "Prelucrarea s-a încheiat, dar rezultatele nu au putut fi afișate:\n\n{0}\n\n"
                     "Detaliile tehnice sunt în jurnalul de mesaje al QGIS, în fila CADex.").format(
                         str(error) or error.__class__.__name__))
+            finally:
+                # the result window's exec() runs a nested event loop, in which the finished
+                # callback of another window can run; the withhold() setting found is put back
+                _ui_helpers.withhold(previous)
+                self._withheld = None
+                self._project_replaced = False
         return guarded
 
     def cancel_task(self):
-        if self._task is not None:
+        if self._awaited is not None:
+            self._end_wait()
+            self.notice(self.tr("Rularea a fost anulată."))
+        elif self._task is not None:
             self._task.cancel()
             self._cancel_btn.setEnabled(False)
             self._run_message = self.tr("Se anulează...")
@@ -681,7 +1061,9 @@ class BaseDialog(QDialog):
         elapsed = elapsed_text(time.monotonic() - self._started)
         self._progress_label.setText(f"{self._run_message}  {elapsed}".strip())
 
-    def _set_running(self, running):
+    def _set_running(self, running, busy=False):
+        """Disable the inputs and show the progress row while a task runs, or give the window
+        back. busy shows the bar without a percentage, for a wait of unknown length."""
         self._processing = running
         # the finished callbacks read some settings back, so they must not change mid-run
         self._body_widget.setEnabled(not running)
@@ -691,6 +1073,7 @@ class BaseDialog(QDialog):
         self._cancel_btn.setEnabled(running)
         self._progress_box.setVisible(running)
         if running:
+            self._progress_bar.setRange(0, 0 if busy else 100)
             self._progress_bar.setValue(0)
             self._show_progress_text()
             self._timer.start()

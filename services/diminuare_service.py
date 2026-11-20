@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 # SPDX-FileCopyrightText: 2026 RYXLAB SOFT TECH SRL (RyxLabs)
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Diminuare Suprafețe: scales deed areas so they add up to the measured contour area.
+"""Diminuare Suprafețe: reduces deed areas so they add up to the measured contour area.
 
 Parcels with a CF/IE keep their area:
 
     A = sum of the deed areas, B = sum over the CF/IE parcels, C = measured contour area
     factor = (C - B) / (A - B), new area = deed area x factor for every other parcel
+
+Areas are never scaled up: with C above A every area stays and the result holds the surplus,
+C - A, and rounding gives no parcel more than its deed area.
 """
 
 import math
@@ -23,10 +26,32 @@ _NUMBER = re.compile(r"^[+-]?\d+(\.\d+)?$")
 _THOUSANDS = re.compile(r"^[+-]?\d{1,3}(\.\d{3})+$")
 _THOUSANDS_COMMA = re.compile(r"^[+-]?\d{1,3}(,\d{3})+$")
 _NUMERIC_TEXT = re.compile(r"^[+-]?[\d.,]+$")
-# a row that sums others up, matched on folded text: "TOTAL", "Subtotal tarla 12", "Sumă"
+# the word of a row that sums others up, matched on folded text: "TOTAL", "Subtotal tarla 12",
+# "Sumă"
 _TOTAL_WORD = re.compile(r"\b(?:sub)?total(?:uri)?\b|\bsuma\b")
+# every text _TOTAL_WORD matches holds one of these, which is tested before the text is folded
+_TOTAL_HINT = re.compile(r"total|sum", re.IGNORECASE)
+# what the name of a total row holds besides the word, folded: "Total general", "Subtotal
+# tarla nr. 12", "Total T 12", "Total sector cadastral 3", "Total suprafață", "Total parcele"
+_NAME_WORDS = frozenset((
+    "general", "generala", "tarla", "tarlaua", "t", "sector", "sectorul", "cadastral", "nr",
+    "suprafata", "suprafete", "parcele"))
+# a number in such a name, alone or with a letter: "12", "T12", "12a"
+_NAME_NUMBER = re.compile(r"[a-z]?\d+[a-z]?")
+# a unit written in a cell of its own, or in the name of a total row, is no data
+_UNITS = frozenset(("mp", "m2", "m²", "ha"))
+# why a row counts as a total row: a cell of it is the name of a total row and nothing more;
+# or, for the word inside a longer text, its area is the sum of the parcel rows above it, or it
+# holds only that text and numbers
+TOTAL_BY_WORD = "word"
+TOTAL_BY_SUM = "sum"
+TOTAL_BY_LABEL = "label"
+# how far, in mp, a total may lie from the sum of its rows, which a table can show rounded
+SUM_SLACK = 1.0
 # CF/IE cell texts that mean no CF/IE, folded and in upper case
-_NO_CF_IE = ("", "NULL", "NONE", "-", "NU", "NO", "FALSE", "FARA")
+_NO_CF_IE = ("", "NULL", "NONE", "NU", "NO", "FALSE", "FARA", "N/A", "NU ARE", "LIPSA", "?")
+# a cell of dashes and spaces alone means no CF/IE too
+_DASHES = "-–—− "
 # row numbers listed in a note before "..."
 LISTED_ROWS = 15
 
@@ -98,14 +123,14 @@ def parse_number(value, decimal=None):
 
 def has_value(value) -> bool:
     """True when a CF/IE cell is filled in. Empty, 0 in any notation ("0", "0,00"), NU, NO,
-    FALSE and FĂRĂ count as no CF/IE."""
+    FALSE, FĂRĂ, LIPSĂ, NU ARE, N/A, a question mark and dashes count as no CF/IE."""
     if value is None:
         return False
     if isinstance(value, (int, float)):
         # an .xlsx gives numbers back as float; NaN is not equal to itself
         return value == value and value != 0
     text = str(value).strip()
-    if fold(text).upper() in _NO_CF_IE:
+    if fold(text).upper() in _NO_CF_IE or not text.strip(_DASHES):
         return False
     return parse_number(text) != 0
 
@@ -134,9 +159,11 @@ def round_half_up(value, decimals=0) -> float:
     return float(Decimal(repr(float(value))).quantize(step, rounding=ROUND_HALF_UP))
 
 
-def distribute(values, total, decimals):
+def distribute(values, total, decimals, caps=None):
     """values rounded to decimals so they add up to total, itself rounded half up: each value
-    is rounded down, and the units still missing go to the largest remainders."""
+    is rounded down, and the units still missing go to the largest remainders, one each. With
+    caps, one for each value, no unit goes to a value that it would lift above its cap, so the
+    result can add up to less than total."""
     step = 10 ** decimals
     # the rounded total times step is a whole number up to float noise
     target = round(round_half_up(total, decimals) * step)
@@ -146,6 +173,9 @@ def distribute(values, total, decimals):
     order = sorted(range(len(values)), key=lambda i: scaled[i] - floors[i],
                    reverse=True)
     if short >= 0:
+        if caps is not None:
+            # the float noise of a cap times step is far below a millionth of a unit
+            order = [i for i in order if floors[i] + 1 <= caps[i] * step + 1e-6]
         for i in order[:short]:
             floors[i] += 1
     else:
@@ -168,15 +198,22 @@ class Result:
     negative_rows: list = field(default_factory=list)  # the bad rows with an area below 0
     left_out: list = field(default_factory=list)      # indexes of total rows
     total_new: float = 0.0      # new areas and CF/IE areas together
+    surplus: float = 0.0        # C - A when the contour is larger than the deeds, else 0
+    decimals: int = 2           # the rounding of the new areas
+    unassigned: float = 0.0     # mp of the rounded contour that no parcel could take
     error: str = ""
 
 
 def compute(areas, fixed_flags, contour, decimals=2, left_out=()) -> Result:
     """The reduction for the parsed areas (None when unreadable) and CF/IE flags. A row with
     a negative area is a bad row, like one without a number, and is also listed in
-    negative_rows; the rows in left_out, such as total rows, take no part. Result.error is a
-    Romanian sentence for the user, empty on success."""
-    result = Result(contour=contour)
+    negative_rows; the rows in left_out, such as total rows, take no part. With a contour
+    larger than the sum of the deed areas no area changes, whatever the rounding: the factor
+    is 1 and Result.surplus holds the difference. Rounding lifts no parcel above its deed
+    area either: the units that would are left out of the sum, and Result.unassigned holds
+    them (see sum_note()). Result.error is a Romanian sentence for the user, empty on
+    success."""
+    result = Result(contour=contour, decimals=decimals)
     result.left_out = sorted(set(left_out))
     skipped = set(result.left_out)
     result.negative_rows = [i for i, a in enumerate(areas)
@@ -186,8 +223,9 @@ def compute(areas, fixed_flags, contour, decimals=2, left_out=()) -> Result:
     result.fixed_rows = [i for i, flag in enumerate(fixed_flags)
                          if flag and areas[i] is not None]
     readable = [i for i, a in enumerate(areas) if a is not None]
-    result.total_deed = sum(areas[i] for i in readable)
-    result.total_fixed = sum(areas[i] for i in result.fixed_rows)
+    # fsum: a running sum of thousands of areas drifts from the sum a user types as the contour
+    result.total_deed = math.fsum(areas[i] for i in readable)
+    result.total_fixed = math.fsum(areas[i] for i in result.fixed_rows)
     free = result.total_deed - result.total_fixed
 
     if not readable:
@@ -195,6 +233,14 @@ def compute(areas, fixed_flags, contour, decimals=2, left_out=()) -> Result:
         return result
     if result.total_deed <= 0:
         result.error = "Suma suprafețelor din acte este 0."
+        return result
+    # as floats, 1000.3 + 2000.1 is less than 3000.4: a difference that rounds to nothing is no
+    # surplus, so a contour typed as the sum of the deed areas is an ordinary reduction
+    surplus = round(contour - result.total_deed, 6)
+    if surplus > 0:
+        result.surplus = surplus
+        result.new_areas = list(areas)
+        result.total_new = round(result.total_deed, 6)
         return result
     # below about 1 mp the division turns floating-point noise into huge factors
     if free <= 1.0:
@@ -221,12 +267,15 @@ def compute(areas, fixed_flags, contour, decimals=2, left_out=()) -> Result:
             "coloana CF/IE.")
         return result
 
-    result.factor = (contour - result.total_fixed) / free
+    # at most 1: a contour above the sum of the deed areas by a difference that rounds to 0 is
+    # no surplus, and it must not scale the areas up
+    result.factor = min(1.0, (contour - result.total_fixed) / free)
     result.reduction_pct = (1.0 - result.factor) * 100.0
 
     fixed = set(result.fixed_rows)
     free_rows = [i for i in readable if i not in fixed]
-    scaled = distribute([areas[i] * result.factor for i in free_rows], target, decimals)
+    scaled = distribute([areas[i] * result.factor for i in free_rows], target, decimals,
+                        caps=[areas[i] for i in free_rows])
     new_areas = [None] * len(areas)
     for i in result.fixed_rows:
         new_areas[i] = areas[i]
@@ -234,7 +283,33 @@ def compute(areas, fixed_flags, contour, decimals=2, left_out=()) -> Result:
         new_areas[i] = value
     result.new_areas = new_areas
     result.total_new = round(sum(a for a in new_areas if a is not None), 6)
+    result.unassigned = round(max(0.0, round_half_up(target, decimals) - sum(scaled)), 6)
     return result
+
+
+def sum_note(result) -> str:
+    """The sentence on the sum of the new areas: on a surplus, that the areas stay the deed
+    areas; otherwise why the new areas and the CF/IE areas do not add up to the contour
+    rounded to result.decimals, "" when they do. "" on an error. The cause is units that no
+    parcel could take without going over its deed area (Result.unassigned), CF/IE areas with
+    more decimals than the rounding, or both."""
+    if result.error:
+        return ""
+    if result.surplus > 0:
+        return (f"Conturul depășește suma suprafețelor din acte cu {fmt.area(result.surplus)}, "
+                "deci suprafețele rămân cele din acte.")
+    target = round_half_up(result.contour, result.decimals)
+    if abs(result.total_new - target) <= 1e-6:
+        return ""
+    if result.unassigned <= 0:
+        cause = "Parcelele cu CF/IE au mai multe zecimale decât rotunjirea aleasă"
+    else:
+        cause = ("La rotunjire, nicio parcelă nu primește o suprafață mai mare decât cea din "
+                 "acte")
+        if abs(result.total_new + result.unassigned - target) > 1e-6:
+            cause += ", iar parcelele cu CF/IE au mai multe zecimale decât rotunjirea aleasă"
+    return (f"{cause}, deci suma nouă este {fmt.area(result.total_new, 4)}, "
+            f"nu {fmt.area(target)}.")
 
 
 def contour_area(geometries, crs, extent=None) -> float:
@@ -258,11 +333,119 @@ def _filled(values) -> int:
     return sum(1 for v in values if v not in (None, ""))
 
 
-def total_rows(rows) -> list:
-    """The indexes of the rows that sum others up: a text cell holding the word total,
-    subtotal, totaluri or sumă, in any case, with or without diacritics."""
-    return [i for i, row in enumerate(rows)
-            if any(isinstance(v, str) and _TOTAL_WORD.search(fold(v)) for v in row)]
+def _is_number(value) -> bool:
+    if isinstance(value, str):
+        return parse_number(value) is not None
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_total_name(text) -> bool:
+    """Whether a text with the word total, subtotal or sumă is the name of a total row and
+    nothing more: the word, alone or with what such a name holds besides it (_NAME_WORDS,
+    numbers, a unit, punctuation). An owner's name ("SC TOTAL AGRO SRL") or a remark ("din
+    total 5000 mp arabil") is a longer text."""
+    rest = _TOTAL_WORD.sub(" ", fold(text))
+    return all(token in _NAME_WORDS or token in _UNITS or _NAME_NUMBER.fullmatch(token)
+               for token in re.findall(r"[^\W_]+", rest))
+
+
+def _is_blank(value) -> bool:
+    """Whether a cell holds no data: empty, dashes alone, or a unit alone ("mp", "m2", "ha")."""
+    if value is None or value == "":
+        return True
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return not text.strip(_DASHES) or fold(text).strip(" .()") in _UNITS
+
+
+def total_candidates(rows) -> dict:
+    """{row index: what makes it a total row whatever the area column} for the rows with the
+    word total, subtotal, totaluri or sumă in a text cell, in any case, with or without
+    diacritics: TOTAL_BY_WORD, TOTAL_BY_LABEL, or None for a row that only its area can make a
+    total row (see total_rows()).
+
+    TOTAL_BY_WORD: a cell is the name of a total row and nothing more. The other rows hold the
+    word inside a longer text, and the word alone does not make them total rows. TOTAL_BY_LABEL:
+    the row's other cells with data are numbers, and it differs from the parcel rows, the rows
+    without the word: a column that most of them fill is empty in it, or its word stands in a
+    column where most of them hold a number. None of this depends on the area column, so it is
+    computed once for a table."""
+    words = {}
+    for i, row in enumerate(rows):
+        columns = [j for j, value in enumerate(row) if isinstance(value, str)
+                   and _TOTAL_HINT.search(value) and _TOTAL_WORD.search(fold(value))]
+        if columns:
+            words[i] = columns
+    found = {i: TOTAL_BY_WORD if any(_is_total_name(rows[i][j]) for j in columns) else None
+             for i, columns in words.items()}
+    if all(found.values()):
+        return found
+    parcels = [row for i, row in enumerate(rows) if i not in words]
+    width = max(len(row) for row in rows)
+    half = len(parcels) / 2.0
+    filled = [sum(1 for row in parcels if j < len(row) and not _is_blank(row[j])) > half
+              for j in range(width)]
+    numeric = [sum(1 for row in parcels if j < len(row) and _is_number(row[j])) > half
+               for j in range(width)]
+    for i, columns in words.items():
+        if found[i]:
+            continue
+        row = rows[i]
+        others = [j for j, value in enumerate(row) if j not in columns and not _is_blank(value)]
+        unlike_a_parcel = (any(numeric[j] for j in columns)
+                           or any(filled[j] and _is_blank(row[j]) for j in range(len(row))))
+        if unlike_a_parcel and all(_is_number(row[j]) for j in others):
+            found[i] = TOTAL_BY_LABEL
+    return found
+
+
+def total_rows(rows, areas, candidates) -> dict:
+    """{row index: TOTAL_BY_WORD, TOTAL_BY_SUM or TOTAL_BY_LABEL} for the rows that sum others
+    up and take no part in the reduction, among candidates, what total_candidates(rows)
+    returns. A row with a cell that is the name of a total row is one
+    whatever its area: a total can count rows hidden in Excel, be typed by hand or stand above
+    its rows. A row with the word inside a longer text needs evidence beyond the word.
+    TOTAL_BY_SUM: its area, within SUM_SLACK, is the sum of at least two parcel rows above it,
+    either all of them or those below the previous total row. TOTAL_BY_LABEL: it holds only
+    that text and numbers. A parcel with the word in its owner's name or in a remark is none
+    of these, and stays a parcel. areas holds the rows' parsed areas, None for an unreadable
+    one."""
+    found = {}
+    # the sum and the number of the parcel rows above: below the previous total, and all
+    part, part_count, whole, whole_count = 0.0, 0, 0.0, 0
+    for i, area in enumerate(areas):
+        if i in candidates:
+            if candidates[i] == TOTAL_BY_WORD:
+                found[i] = TOTAL_BY_WORD
+            elif area is not None and (
+                    (part_count > 1 and abs(area - part) <= SUM_SLACK)
+                    or (whole_count > 1 and abs(area - whole) <= SUM_SLACK)):
+                found[i] = TOTAL_BY_SUM
+            elif candidates[i]:
+                found[i] = TOTAL_BY_LABEL
+            if i in found:
+                part, part_count = 0.0, 0
+                continue
+        if area is not None and area >= 0:
+            part, part_count = part + area, part_count + 1
+            whole, whole_count = whole + area, whole_count + 1
+    return found
+
+
+# a total row's reason, for a list such as "5 (suma rândurilor de deasupra)"
+TOTAL_REASONS = {TOTAL_BY_WORD: "denumire de total",
+                 TOTAL_BY_SUM: "suma rândurilor de deasupra",
+                 TOTAL_BY_LABEL: "doar denumirea și numere"}
+
+
+def total_list(totals, name) -> str:
+    """The total rows of total_rows() with the reason of each, for a note: "5 (suma rândurilor
+    de deasupra), 9 (doar denumirea și numere)", the first LISTED_ROWS of them. name gives
+    the text shown for a row index."""
+    shown = ", ".join(f"{name(i)} ({TOTAL_REASONS[totals[i]]})"
+                      for i in sorted(totals)[:LISTED_ROWS])
+    return shown + ("..." if len(totals) > LISTED_ROWS else "")
 
 
 class Table(NamedTuple):
@@ -272,6 +455,7 @@ class Table(NamedTuple):
     numbers: list         # the Excel row number of each row
     header_number: int    # the Excel row number of the header
     hidden: list          # the Excel row numbers of the filled rows hidden in Excel
+    sheet: str            # the sheet the table was read from
 
 
 def _column_names(values) -> list:
@@ -290,10 +474,12 @@ def read_sheet(path, sheet_name=None) -> Table:
 
     The header is the first row with more than half as many filled cells as the fullest row,
     so a title above the table is skipped. Rows hidden in Excel, by a filter or by hand, are
-    left out. Formulas give their last computed value.
+    left out. Formulas give their last computed value. Without sheet_name, or with a name
+    the file lacks, the sheet is xlsx.default_sheet(); Table.sheet names the one read.
     """
     from . import xlsx
     names, raw, hidden_numbers = xlsx.read_table(path, sheet_name)
+    sheet = sheet_name if sheet_name in names else xlsx.default_sheet(path)
     concealed = set(hidden_numbers)
     widest = max((_filled(values) for number, values in enumerate(raw, start=1)
                   if number not in concealed), default=0)
@@ -316,11 +502,12 @@ def read_sheet(path, sheet_name=None) -> Table:
         numbers.append(number)
     width = len(header or [])
     rows = [(list(r) + [None] * width)[:width] for r in rows]
-    return Table(names, header or [], rows, numbers, header_number, hidden)
+    return Table(names, header or [], rows, numbers, header_number, hidden, sheet or "")
 
 
-def write_excel(path, header, rows, result, meta, area_col, fixed_col):
-    """The source table with the reduced area and the difference, and a Sumar sheet."""
+def write_excel(path, header, rows, result, meta, area_col, fixed_col) -> int:
+    """The source table with the reduced area and the difference, and a Sumar sheet. Returns
+    the number of cells whose text was cut to the length an Excel cell holds."""
     from . import xlsx_report
 
     new_header = list(header) + ["Suprafață diminuată (mp)", "Diferență (mp)"]
@@ -344,22 +531,39 @@ def write_excel(path, header, rows, result, meta, area_col, fixed_col):
     summary.section("Informații")
     summary.facts(meta)
     summary.section("Calcul")
-    summary.table(
-        ["Mărime", "Valoare", "", "Explicație"],
-        [["A", round(result.total_deed, 4), "", "Suma suprafețelor din acte"],
-         ["B", round(result.total_fixed, 4), "",
-          "Suma suprafețelor parcelelor cu CF/IE, care nu se modifică"],
-         ["C", round(result.contour, 4), "", "Suprafața măsurată a conturului"],
-         ["Factor", round(result.factor, 8), "", "(C - B) / (A - B)"],
-         ["Diminuare", xlsx_report.percent(result.reduction_pct, 4), "",
-          "Cât pierde fiecare parcelă fără CF/IE; negativ înseamnă majorare"],
-         ["Suma nouă", round(result.total_new, 4), "",
-          "Suma suprafețelor diminuate și a parcelelor cu CF/IE"]],
-        number_format="General")
-    summary.note("Suprafețele noi sunt rotunjite astfel încât suma lor, împreună cu parcelele "
-                 "cu CF/IE, să fie egală cu suprafața conturului rotunjită la aceeași precizie. "
-                 "Dacă parcelele cu CF/IE au mai multe zecimale decât rotunjirea, suma poate "
-                 "diferi cu mai puțin de o unitate de rotunjire.")
+    calculation = [
+        ["A", round(result.total_deed, 4), "", "Suma suprafețelor din acte"],
+        ["B", round(result.total_fixed, 4), "",
+         "Suma suprafețelor parcelelor cu CF/IE, care nu se modifică"],
+        ["C", round(result.contour, 4), "", "Suprafața măsurată a conturului"]]
+    if result.surplus > 0:
+        calculation += [
+            ["C - A", round(result.surplus, 4), "",
+             "Cu cât depășește conturul suma suprafețelor din acte"],
+            ["Factor", round(result.factor, 8), "",
+             "Conturul este mai mare decât suma din acte, deci suprafețele nu se modifică"]]
+        note = ("Conturul este mai mare decât suma suprafețelor din acte, deci suprafețele au "
+                "rămas cele din acte, nerotunjite.")
+    else:
+        calculation.append(["Factor", round(result.factor, 8), "", "(C - B) / (A - B)"])
+        difference = sum_note(result)
+        if difference:
+            rounded = fmt.area(round_half_up(result.contour, result.decimals))
+            note = ("Suprafața conturului, rotunjită la aceeași precizie ca suprafețele noi, "
+                    f"este {rounded}. {difference}")
+        else:
+            note = ("Suprafețele noi sunt rotunjite astfel încât suma lor, împreună cu "
+                    "parcelele cu CF/IE, să fie egală cu suprafața conturului rotunjită la "
+                    "aceeași precizie.")
+    calculation += [
+        ["Diminuare", xlsx_report.percent(result.reduction_pct, 4), "",
+         "Cât pierde fiecare parcelă fără CF/IE"],
+        ["Suma nouă", round(result.total_new, 4), "",
+         "Suma suprafețelor diminuate și a parcelelor cu CF/IE"]]
+    summary.table(["Mărime", "Valoare", "", "Explicație"], calculation,
+                  number_format="General")
+    summary.note(note)
     xlsx_report.write_table(wb, "Diminuare", new_header, out_rows, row_colors=colors,
                             text_columns=[header[fixed_col]] if fixed_col is not None else ())
     xlsx_report.save(wb, path)
+    return wb.cut_cells

@@ -4,17 +4,19 @@
 """Comparison of two layers matched on a key column, and the value and geometry rules
 shared with cgxml_compare."""
 
+import math
 import re
+from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, time
 from typing import Optional
 
 from qgis.core import (  # type: ignore
-    QgsExpression, QgsFeature, QgsFeatureRequest, QgsField, QgsFields, QgsGeometry,
-    QgsVectorLayer,
+    Qgis, QgsExpression, QgsFeature, QgsFeatureRequest, QgsField, QgsFields, QgsGeometry,
+    QgsVectorLayer, QgsWkbTypes,
 )
 
-from . import codes, fmt, roles, settings_service, stereo70, xlsx_report
+from . import codes, fmt, overlay, roles, settings_service, stereo70, xlsx_report
 from .layer_sources import LayerCache, LayerInfo, unique_name
 from .roles import fold
 from .tasks import CadexTask
@@ -82,48 +84,115 @@ def kind_rows(kinds, with_split=False):
 
 def normalize_key(value):
     """The key as text, None when empty. 100001.0 and "100001" are the same key, since a
-    Shapefile may store an integer column as real."""
+    Shapefile may store an integer column as real. A real that is no number (NaN) or is
+    infinite is no key."""
     if is_null(value):
         return None
-    if isinstance(value, float) and value == int(value):
-        value = int(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        if value == int(value):
+            value = int(value)
     text = str(value).strip()
     return text or None
+
+
+# s and t with a cedilla, which older keyboards and fonts write for the Romanian letters with
+# a comma below: the same letters
+_COMMA_BELOW = str.maketrans("\u015e\u015f\u0162\u0163", "\u0218\u0219\u021a\u021b")
+
+
+def match_key(key: str) -> str:
+    """The form under which two keys name the same record: letter case and the two spellings
+    of ș and ț carry no meaning, leading zeros do ("0123" is not "123")."""
+    return key.translate(_COMMA_BELOW).casefold()
 
 
 def normalize_value(value, fold_text=False):
     """The comparable form of a value.
 
-    NULL equals empty text, 12 equals 12.0, outer and repeated spaces are ignored, and text
-    stays text ("0123" differs from "123"). fold_text also ignores case and diacritics.
+    NULL equals empty text, a number stays a number, a date or a time becomes Python's,
+    outer and repeated spaces are ignored, ș and ț are the same letters with a comma or with
+    a cedilla, and text stays text ("0123" differs from "123"). fold_text also ignores case
+    and diacritics.
     """
     if is_null(value):
         return None
-    if isinstance(value, bool):
+    if isinstance(value, (bool, int, float, date, time)):
         return value
-    if isinstance(value, (int, float)):
-        return float(value)
     type_name = type(value).__name__
     if type_name in ("QDate", "QDateTime", "QTime"):
-        return None if value.isNull() else value.toString("yyyy-MM-dd HH:mm:ss")
-    text = " ".join(str(value).split())
+        if value.isNull() or not value.isValid():
+            return None
+        reader = {"QDate": "toPyDate", "QDateTime": "toPyDateTime", "QTime": "toPyTime"}
+        return getattr(value, reader[type_name])()
+    text = " ".join(str(value).translate(_COMMA_BELOW).split())
     if fold_text:
         text = fold(text)
     return text or None
 
 
-def _as_float(value):
-    if isinstance(value, float):
+def is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _as_number(value):
+    """value as an int or a float, None for anything that is no number. Text reads with a
+    decimal point or comma."""
+    if is_number(value):
         return value
-    try:
-        return float(str(value).replace(",", "."))
-    except (TypeError, ValueError):
+    if not isinstance(value, str):
         return None
+    text = value.strip().replace(",", ".")
+    for read in (int, float):
+        try:
+            return read(text)
+        except ValueError:
+            continue
+    return None
+
+
+def _whole(number) -> bool:
+    return isinstance(number, int) or (math.isfinite(number) and number.is_integer())
+
+
+# how text columns write a date and a time: ISO, the Shapefile driver's
+# "2024/03/01 10:30:00.000" and the Romanian "01.03.2024"
+_DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%d.%m.%Y", "%d/%m/%Y")
+_TIME_FORMATS = ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M")
+
+
+def _as_moment(value):
+    """value as a datetime (a date is its midnight) or a time, None for anything else. Text
+    is read in _DATE_FORMATS and _TIME_FORMATS."""
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, time):
+        return value.replace(tzinfo=None)
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.replace("T", " ").split())
+    for day in _DATE_FORMATS:
+        for pattern in [day] + [f"{day} {hour}" for hour in _TIME_FORMATS]:
+            try:
+                return datetime.strptime(text, pattern)
+            except ValueError:
+                continue
+    for hour in _TIME_FORMATS:
+        try:
+            return datetime.strptime(text, hour).time()
+        except ValueError:
+            continue
+    return None
 
 
 # CGXML columns that join the values of several parcels or persons, with their separators:
-# the order and the repeats carry no meaning, and one parcel can hold several numbers itself.
-# A split imobil joins the different values of its pieces with "; ".
+# the order carries no meaning, and one parcel can hold several numbers itself. A number
+# written twice is one number; a name written twice is two persons with that name
+# (cgxml_reader._join_persons). A split imobil joins the different values of its pieces with
+# "; ".
 LIST_COLUMNS = {"nr_tarla": ",;", "nr_parcele": ",;", "categ_fol": ",;", "nr_titlu": ",;",
                 "propr": ",;", "alte_pers": ";", "nr_cad_vechi": ";", "nr_cf_vechi": ";"}
 # CGXML columns of numbers and codes typed by hand, where case and spaces carry no meaning
@@ -156,30 +225,50 @@ def _code(text, column):
     return "" if _NO_NUMBER.fullmatch(text) else text
 
 
-def comparable(value, fold_text=False, column=""):
-    """normalize_value(); for a CGXML list or code column, the set of its values."""
-    if column not in LIST_COLUMNS and column not in CODE_COLUMNS:
-        return normalize_value(value, fold_text)
+def counted(value, fold_text=False, column="") -> Counter:
+    """{value: times} of the values in a CGXML list or code column: a number or a code once,
+    a person as often as the column lists the name."""
     if is_null(value):
-        return None
+        return Counter()
     if isinstance(value, float) and value.is_integer():
         value = int(value)
     separators = LIST_COLUMNS.get(column)
     pieces = re.split(f"[{separators}]", str(value)) if separators else [str(value)]
     if column in CODE_COLUMNS:
-        found = {_code(piece, column) for piece in pieces}
+        found = Counter({_code(piece, column) for piece in pieces})
     else:
-        found = {normalize_value(piece, fold_text) for piece in pieces}
-    return frozenset(found - {"", None}) or None
+        found = Counter(normalize_value(piece, fold_text) for piece in pieces)
+    for empty in ("", None):
+        found.pop(empty, None)
+    return found
+
+
+def comparable(value, fold_text=False, column=""):
+    """normalize_value(); for a CGXML list or code column, its values with how often each
+    occurs (counted())."""
+    if column not in LIST_COLUMNS and column not in CODE_COLUMNS:
+        return normalize_value(value, fold_text)
+    return frozenset(counted(value, fold_text, column).items()) or None
 
 
 def normalized_differ(a, b) -> bool:
-    """Whether two comparable() values differ."""
-    # the column is numeric in one layer and text in the other: compare as numbers
-    if isinstance(a, float) or isinstance(b, float):
-        fa, fb = _as_float(a), _as_float(b)
-        if fa is not None and fb is not None:
-            return abs(fa - fb) > 1e-9 * max(1.0, abs(fa), abs(fb))
+    """Whether two comparable() values differ. Whole numbers compare exactly, so two long
+    codes that differ in their last digit differ; a real with decimals compares within the
+    precision of a float."""
+    # a column that is numeric in one layer and text in the other compares as numbers
+    if is_number(a) or is_number(b):
+        na, nb = _as_number(a), _as_number(b)
+        if na is not None and nb is not None:
+            if na != na or nb != nb:
+                return (na != na) != (nb != nb)
+            if _whole(na) and _whole(nb):
+                return int(na) != int(nb)
+            return abs(na - nb) > 1e-9 * max(1.0, abs(na), abs(nb))
+    # and one that is a date in one layer and text in the other as dates
+    if isinstance(a, (date, time)) or isinstance(b, (date, time)):
+        ma, mb = _as_moment(a), _as_moment(b)
+        if ma is not None and mb is not None:
+            return type(ma) is not type(mb) or ma != mb
     return a != b
 
 
@@ -253,11 +342,40 @@ def geometry_change(old_geom, new_geom, tolerance):
     before, after = old_geom.area(), new_geom.area()
     if _exactly_equal(old_geom, new_geom):
         return None
-    moved = old_geom.symDifference(new_geom)
+    moved = overlay.sym_difference(old_geom, new_geom)
     moved_area = moved.area() if moved is not None and not moved.isEmpty() else 0.0
     if moved_area <= tolerance and abs(after - before) <= tolerance:
         return None
     return before, after, moved_area
+
+
+# metres: a point or a line has moved when one of its points lies farther than this from the
+# other version, the millimetre cadastral coordinates are written to
+DISTANCE_TOLERANCE = 0.001
+# the label of a point's or a line's geometry in the reports' lists of what changed
+GEOMETRY_DISTANCE = "Geometrie (distanța, m)"
+
+
+def has_area(wkb_type) -> bool:
+    """Whether a layer of this geometry type holds polygons, whose change is measured as an
+    area; points and lines have none."""
+    return QgsWkbTypes.geometryType(wkb_type) == Qgis.GeometryType.Polygon
+
+
+def distance_change(old_geom, new_geom, tolerance=DISTANCE_TOLERANCE):
+    """(None, None, distance moved in metres) for a point or a line that moved by more than
+    tolerance, else None. The distance is the largest one from a point of either version to
+    the other version; it is None when only one version has a geometry."""
+    old_geom, new_geom = _usable(old_geom), _usable(new_geom)
+    if old_geom is None or new_geom is None:
+        return None if old_geom is new_geom else (None, None, None)
+    if _exactly_equal(old_geom, new_geom):
+        return None
+    distance = old_geom.hausdorffDistance(new_geom)
+    # negative when GEOS cannot measure it; the two versions still differ
+    if distance < 0:
+        return None, None, None
+    return (None, None, distance) if distance > tolerance else None
 
 
 def key_fields(key) -> list:
@@ -354,6 +472,104 @@ def _rows_without_key(source, column) -> int:
     return count
 
 
+@dataclass
+class LayerPlan:
+    """How two imobile layers are compared where nothing is chosen by hand: what the window
+    preselects and what Processing takes for a parameter left empty."""
+    key_old: Optional[str]
+    key_new: Optional[str]
+    # the columns both layers have, the keys and the row numbers left out
+    columns: list
+    # of columns, those compared unless others are chosen
+    ticked: list
+    # cgxml_compare.eterra_advice()
+    advice: str
+    # the CGXML column that names a construcție's imobil in the construcții layers converted
+    # with these imobile: "ie_imobil" when the imobile pair on their IE, else "id"
+    imobil_column: str
+
+
+@dataclass
+class BuildingPlan:
+    """How two construcții layers are compared where nothing is chosen by hand."""
+    # [imobil column, number column] of each layer, None for a column that is not known
+    key_old: list
+    key_new: list
+    columns: list
+    ticked: list
+
+
+def _info(source, info):
+    """The LayerInfo given, else read from a layer, on the main thread; None for a Processing
+    feature source without one."""
+    if info is not None:
+        return info
+    return LayerInfo(source) if isinstance(source, QgsVectorLayer) else None
+
+
+def _data_fields(source, info) -> list:
+    """The columns of a layer or feature source that hold data; a name spelled twice in
+    different letter case counts once, as the first spelling."""
+    skip = set(info.row_number_fields) if info is not None else set()
+    names, seen = [], set()
+    for name in source.fields().names():
+        if name not in skip and name.lower() not in seen:
+            seen.add(name.lower())
+            names.append(name)
+    return names
+
+
+def _compared(old, new, infos, keys, defaults):
+    """(columns, ticked) of a plan. defaults are the CGXML columns two Conversie CGXML layers
+    compare unless others are chosen; other layers compare every column they share."""
+    from .cgxml_compare import converted_columns
+    new_names = set(_data_fields(new, infos[1]))
+    columns = [name for name in _data_fields(old, infos[0])
+               if name in new_names and name not in keys]
+    chosen = converted_columns(*infos, defaults)
+    return columns, [name for name in columns if chosen is None or name in chosen]
+
+
+def layer_plan(old, new, old_info=None, new_info=None, keys=(None, None),
+               names=("Layerul vechi", "Layerul nou")) -> LayerPlan:
+    """The LayerPlan of two imobile layers, or of two Processing feature sources with their
+    LayerInfo. keys are the key columns chosen by hand, None for a side left to
+    key_columns(); names is what the advice calls each layer."""
+    from .cgxml_compare import DEFAULT_COLUMNS, eterra_advice
+    infos = (_info(old, old_info), _info(new, new_info))
+    found = key_columns(old, new, *infos) if all(infos) and not all(keys) else (None, None)
+    listed = [source.fields().names() for source in (old, new)]
+    # a key chosen for one layer only is the other layer's too when it has that column
+    key_old, key_new = (keys[side] or (keys[1 - side] if keys[1 - side] in listed[side]
+                                       else found[side]) for side in (0, 1))
+    columns, ticked = _compared(old, new, infos, (key_old, key_new), DEFAULT_COLUMNS)
+    ie_columns = tuple(info.column_of("ie") if info is not None else None for info in infos)
+    by_ie = all(ie_columns) and (key_old, key_new) == ie_columns
+    return LayerPlan(key_old, key_new, columns, ticked, eterra_advice(*infos, names),
+                     "ie_imobil" if by_ie else "id")
+
+
+def building_plan(old, new, old_info=None, new_info=None, imobil_column="id",
+                  keys=((None, None), (None, None))) -> BuildingPlan:
+    """The BuildingPlan of two construcții layers or feature sources. imobil_column comes
+    from the LayerPlan of their imobile; keys are the (imobil column, number column) chosen
+    by hand for each layer, None for one left to the columns a conversion wrote. An imobil
+    column of "" is the choice of none: the construcții pair by their number alone, and the
+    column a conversion wrote for the imobil is one of the columns to compare."""
+    from .cgxml_compare import BUILDING_COLUMNS
+    infos = (_info(old, old_info), _info(new, new_info))
+    sides = []
+    for info, (imobil, number) in zip(infos, keys):
+        if info is not None:
+            if imobil is None:
+                imobil = info.column_of(imobil_column)
+            number = number or info.column_of("nr_constr")
+        sides.append([imobil or None, number or None])
+    chosen = [name for side in sides for name in side if name]
+    columns, ticked = _compared(old, new, infos, chosen, BUILDING_COLUMNS)
+    return BuildingPlan(sides[0], sides[1], columns, ticked)
+
+
 # the result categories of a comparison
 ADDED, DELETED, CHANGED = "added", "deleted", "changed"
 
@@ -397,6 +613,11 @@ class CompareTask(CadexTask):
         self._measured_area = None
         # the rows read from each layer, those without a key and the repeats included
         self.old_read = self.new_read = 0
+        # {match_key(key): the key as first read}, under which both layers' rows are kept
+        self._spelling = {}
+        # a layer holds points or lines, so the geometry is compared by distance, not by area
+        self.by_distance = compare_geometry and not (has_area(old.wkb_type)
+                                                     and has_area(new.wkb_type))
 
     def missing_columns(self) -> str:
         """The Romanian sentence for the first layer that lacks a key or compared column, ""
@@ -425,6 +646,8 @@ class CompareTask(CadexTask):
             if self.stopped():
                 return {}, {}, 0, {}, 0
             row_key = key_of(feature, fields)
+            if row_key is not None:
+                row_key = self._spelling.setdefault(match_key(row_key), row_key)
             values = {name: feature[name] for name in names}
             rows.append((row_key, {"values": values,
                                    "geometry": QgsGeometry(geometry)
@@ -465,8 +688,11 @@ class CompareTask(CadexTask):
             for key in sorted(set(self.old_rows) & set(self.new_rows), key=sort_key):
                 if self.stopped():
                     return False
-                change = geometry_change(self.old_rows[key]["geometry"],
-                                         self.new_rows[key]["geometry"], self.tolerance)
+                old_geom, new_geom = self.old_rows[key]["geometry"], self.new_rows[key]["geometry"]
+                if self.by_distance:
+                    change = distance_change(old_geom, new_geom)
+                else:
+                    change = geometry_change(old_geom, new_geom, self.tolerance)
                 if change is not None:
                     self.geometry_changes[key] = change
         self.report(end)
@@ -512,8 +738,10 @@ class CompareTask(CadexTask):
                 fields.append(QgsField(kind_field, FIELD_STRING))
             fields.append(QgsField(unique_name(fields, "modificari"), FIELD_STRING))
             if self.compare_geometry:
-                fields.append(QgsField(unique_name(fields, "sup_mutata"), FIELD_DOUBLE,
-                                       "double", 20, 2))
+                # the moved area of a polygon in mp, the distance a point or a line moved in m
+                name, decimals = ("dist_mutata", 3) if self.by_distance else ("sup_mutata", 2)
+                fields.append(QgsField(unique_name(fields, name), FIELD_DOUBLE, "double", 20,
+                                       decimals))
         features, left_out = [], 0
         for key in keys:
             source = by_key.get(key)
@@ -532,11 +760,35 @@ class CompareTask(CadexTask):
                     names.append("geometrie")
                 values.append(", ".join(names))
                 if self.compare_geometry:
-                    change = self.geometry_changes.get(key)
-                    values.append(round(change[2], 2) if change else None)
+                    values.append(self._moved(key))
             feature.setAttributes(values)
             features.append(feature)
         return ResultFeatures(fields, features, snapshot.wkb_type, kind_field, left_out)
+
+    def _moved(self, key):
+        """The moved area of a key's polygon in mp, or the distance its point or line moved
+        in m; None when its geometry did not change or the distance is not known."""
+        moved = self.geometry_changes.get(key, (None, None, None))[2]
+        return None if moved is None else round(moved, 3 if self.by_distance else 2)
+
+    def geometry_fact(self) -> str:
+        """What was compared of the geometry, for the report and the result."""
+        if not self.compare_geometry:
+            return "Nu"
+        if self.by_distance:
+            return ("Da, după distanță, cu toleranța "
+                    f"{fmt.number(DISTANCE_TOLERANCE * 1000, 0)} mm (puncte și linii)")
+        return f"Da, toleranță {fmt.area(self.tolerance)}"
+
+    def geometry_note(self) -> str:
+        """The sentence on a geometry compared by distance, "" for one compared by area or
+        not compared."""
+        if not self.by_distance:
+            return ""
+        return (f"Layerele '{self.old.name}' și '{self.new.name}' nu sunt amândouă de "
+                "poligoane, deci geometria s-a comparat după distanță: este mutată când un "
+                f"punct al ei se află la peste {fmt.number(DISTANCE_TOLERANCE * 1000, 0)} mm "
+                "de cealaltă versiune.")
 
     def changed_keys(self):
         return sorted(set(self.changed) | set(self.geometry_changes), key=sort_key)
@@ -574,8 +826,7 @@ class CompareTask(CadexTask):
                 ("Coloane comparate ale construcțiilor", ", ".join(b.fields) or "-"),
             ]
         facts += [
-            ("Geometrie comparată", f"Da, toleranță {fmt.area(self.tolerance)}"
-             if self.compare_geometry else "Nu"),
+            ("Geometrie comparată", self.geometry_fact()),
             ("Se ignoră majusculele și diacriticele", "Da" if self.fold_text else "Nu"),
             ("Sistem de coordonate", stereo70.NAME),
         ]
@@ -635,15 +886,18 @@ class CompareTask(CadexTask):
             lead = [key, self.change_kind(key)] if self.compare_geometry else [key]
             for field, before, after in self.changed.get(key, []):
                 detail.append(lead + [field, before, after, ""])
-            if key in self.geometry_changes:
-                before, after, moved = self.geometry_changes[key]
+            if key in self.geometry_changes and self.by_distance:
+                detail.append(lead + [GEOMETRY_DISTANCE, None, None, self._moved(key)])
+            elif key in self.geometry_changes:
+                before, after, _moved = self.geometry_changes[key]
                 detail.append(lead + [GEOMETRY, round(before, 2), round(after, 2),
-                                      round(moved, 2)])
+                                      self._moved(key)])
         if detail:
             xlsx_report.write_table(
                 wb, title("Modificate"),
                 ["Cheie"] + (["Tip modificare"] if self.compare_geometry else [])
-                + ["Coloana", "Valoare veche", "Valoare nouă", "Suprafață mutată (mp)"],
+                + ["Coloana", "Valoare veche", "Valoare nouă",
+                   "Distanță (m)" if self.by_distance else "Suprafață mutată (mp)"],
                 detail, row_colors=[xlsx_report.MIXED] * len(detail),
                 text_columns=["Cheie"])
         duplicates = ([["vechi", k, n] for k, n in sorted(self.old_dups.items())]

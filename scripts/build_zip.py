@@ -8,12 +8,19 @@ Usage: python scripts/build_zip.py [output folder, default dist/]
 
 A build into the plugin's dist/ folder removes the zips of older versions there; any other
 output folder keeps its files.
+
+One commit gives the same zip on Windows and on Linux, as long as both Pythons' zlib compress
+alike: text files are written with LF line endings whatever the working tree holds, and every
+entry carries the time of the commit.
 """
 
 import configparser
+import hashlib
 import os
 import stat
+import subprocess
 import sys
+import time
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,13 +28,18 @@ PACKAGE = "cadex"
 
 # skipped at any depth, like every name starting with "."
 SKIP_DIRS = {"__pycache__", "test", "scripts", "docs", "libs", "dist", "venv"}
-SKIP_FILES = {"JOURNAL.md"}
+SKIP_FILES = {"JOURNAL.md", "CHANGELOG.md", "SECURITY.md"}
 # besides every .py file and the .svg files under icons/
 SHIPPED = {"metadata.txt", "LICENSE", "README.md", "icons/ATTRIBUTION.md", "data/siruta.db"}
 REQUIRED = ("__init__.py", "metadata.txt", "LICENSE", "icons/cadex.svg", "data/siruta.db",
             "processing_provider/provider.py", "help_texts.py")
 # plugins.qgis.org flags a .py entry with an execute bit
 ENTRY_MODE = (stat.S_IFREG | 0o644) << 16
+# git's autocrlf checks these out with CRLF on Windows
+TEXT_SUFFIXES = (".py", ".svg", ".md", ".txt")
+TEXT_FILES = {"LICENSE"}
+# the earliest time a zip entry can hold, for a build outside a git checkout
+NO_COMMIT_TIME = (1980, 1, 1, 0, 0, 0)
 
 
 def plugin_version() -> str:
@@ -68,6 +80,30 @@ def contents(root: str) -> tuple:
     return ship, stray
 
 
+def entry_bytes(root: str, rel: str) -> bytes:
+    """The bytes the zip holds for a shipped file: text files with LF line endings."""
+    with open(os.path.join(root, *rel.split("/")), "rb") as fp:
+        data = fp.read()
+    if rel.endswith(TEXT_SUFFIXES) or rel in TEXT_FILES:
+        data = data.replace(b"\r\n", b"\n")
+    return data
+
+
+def entry_time(root: str) -> tuple:
+    """The modification time of every entry, in UTC: the time of the commit checked out in
+    root, so each release has its own. If all releases had the same time, unpacking over an
+    older copy of the plugin could leave an edited .py file of unchanged size with an
+    unchanged modification time, and Python would keep using its stale .pyc."""
+    if not os.path.exists(os.path.join(root, ".git")):
+        return NO_COMMIT_TIME
+    try:
+        seconds = subprocess.run(["git", "-C", root, "log", "-1", "--format=%ct"],
+                                 capture_output=True, text=True, check=True).stdout
+        return time.gmtime(int(seconds))[:6]
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return NO_COMMIT_TIME
+
+
 def build(dist: str = None) -> str:
     ship, stray = contents(ROOT)
     if stray:
@@ -81,21 +117,26 @@ def build(dist: str = None) -> str:
     dist = os.path.abspath(dist or own_dist)
     os.makedirs(dist, exist_ok=True)
     out = os.path.join(dist, f"{PACKAGE}.{plugin_version()}.zip")
+    stamp = entry_time(ROOT)
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
         for rel in ship:
-            path = os.path.join(ROOT, *rel.split("/"))
-            info = zipfile.ZipInfo.from_file(path, f"{PACKAGE}/{rel}")
+            info = zipfile.ZipInfo(f"{PACKAGE}/{rel}", stamp)
             info.external_attr = ENTRY_MODE
+            # 3 is Unix; left alone, zipfile records the system of the build machine
+            info.create_system = 3
             info.compress_type = zipfile.ZIP_DEFLATED
-            with open(path, "rb") as fp:
-                zf.writestr(info, fp.read())
+            zf.writestr(info, entry_bytes(ROOT, rel))
     if same_folder(dist, own_dist):
         for name in os.listdir(dist):
             if (name.startswith(f"{PACKAGE}.") and name.endswith(".zip")
                     and os.path.join(dist, name) != out):
                 os.remove(os.path.join(dist, name))
     size_kb = os.path.getsize(out) / 1024
-    print(f"{out}\n{len(ship)} files, {size_kb:.0f} KB")
+    with open(out, "rb") as fp:
+        digest = hashlib.sha256(fp.read()).hexdigest()
+    dated = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d} UTC".format(*stamp)
+    print(f"{out}\n{len(ship)} files, {size_kb:.0f} KB, entries dated {dated}\n"
+          f"SHA-256 {digest}")
     return out
 
 

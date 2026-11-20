@@ -39,6 +39,8 @@ LABEL_DEFAULTS = {
     "sup_tot": ("", " mp"),
 }
 DEFAULT_LABELS = {"imobile": ("id", "ie"), "constructii": ("nr_constr", "destinatie")}
+# DXF label text height ceilings in metres; a construcție's stays below an imobil's
+LABEL_MAX_HEIGHT = {"imobile": 2.5, "constructii": 1.5}
 
 
 def _never():
@@ -155,7 +157,7 @@ class ReadResult:
 def read_all(paths, recursive=True, stop=_never, progress=None) -> ReadResult:
     """Read and finalize every record of the sources. progress receives 0 to 1."""
     siruta.retry()
-    sources = cgxml_sources.list_sources(paths, recursive)
+    sources = cgxml_sources.list_sources(paths, recursive, stop)
     result = ReadResult(file_count=sum(
         1 for source in sources if not isinstance(source, cgxml_sources.Unreadable)))
     for source, parsed, problem in cgxml_sources.read_each(sources, stop, progress):
@@ -189,15 +191,20 @@ def read_all(paths, recursive=True, stop=_never, progress=None) -> ReadResult:
     return result
 
 
-def nothing_read(errors) -> str:
-    """The reason a run whose sources hold no readable file writes nothing, with the first
-    problems."""
+def problem_lines(errors) -> str:
+    """The first of errors, [(file, problem)], one on a line, and the number of the rest."""
     shown = 10
     lines = [f"{name}: {problem}" for name, problem in errors[:shown]]
     if len(errors) > shown:
         lines.append("... și încă " + fmt.count(len(errors) - shown, "fișier", "fișiere"))
+    return "\n".join(lines)
+
+
+def nothing_read(errors) -> str:
+    """The reason a run whose sources hold no readable file writes nothing, with the first
+    problems."""
     return ("Niciun fișier nu a putut fi citit, deci nu s-a scris niciun rezultat:\n\n"
-            + "\n".join(lines))
+            + problem_lines(errors))
 
 
 def unmapped_notes(which: str, records) -> list:
@@ -275,9 +282,19 @@ def _blank_to_null(value):
     return None if value == "" else value
 
 
-def output_fields(which, layout, shapefile=False):
-    """(QgsFields, [(key, output name)]) for a column layout."""
+def output_fields(which, layout, shapefile=False, records=()):
+    """(QgsFields, [(key, output name)]) for a column layout. A text column of a Shapefile has
+    the room its column is given in cgxml_columns, or the width of the longest value of
+    records, the records to be written, when that is more: every dBase row takes the full
+    width of each column, and a value typed in afterwards has to fit it."""
     names = cgxml_columns.output_names(layout, shapefile)
+    longest = {}
+    if shapefile:
+        for record in records:
+            for key, _name in names:
+                value = record.get(key)
+                if isinstance(value, str):
+                    longest[key] = max(longest.get(key, 0), len(value.encode("utf-8")))
     fields = QgsFields()
     for key, name in names:
         kind = cgxml_columns.kind_of(which, key)
@@ -287,9 +304,11 @@ def output_fields(which, layout, shapefile=False):
             fields.append(QgsField(name, FIELD_LONGLONG, "integer64", 18))
         elif kind == "real":
             fields.append(QgsField(name, FIELD_DOUBLE, "double", 20, 2))
+        elif shapefile:
+            width = cgxml_columns.shapefile_width(which, key, longest.get(key, 0))
+            fields.append(QgsField(name, FIELD_STRING, "string", width))
         else:
-            fields.append(QgsField(name, FIELD_STRING, "string",
-                                   cgxml_columns.SHP_TEXT_LIMIT if shapefile else 0))
+            fields.append(QgsField(name, FIELD_STRING, "string", 0))
     return fields, names
 
 
@@ -314,7 +333,8 @@ def write_vector(path, driver, table, which, layout, records, append=False, stop
     after each. Returns (features written, features offered, texts truncated, the writer's
     error for the features it refused). Raises Canceled when stop() turns true."""
     shapefile = driver == "ESRI Shapefile"
-    fields, names = output_fields(which, layout, shapefile)
+    fields, names = output_fields(
+        which, layout, shapefile, [r for r in records if r.get("_geometry") is not None])
     options = QgsVectorFileWriter.SaveVectorOptions()
     options.driverName = driver
     options.fileEncoding = "UTF-8"
@@ -358,7 +378,8 @@ def write_vector(path, driver, table, which, layout, records, append=False, stop
 
 
 def write_xlsx(path, layouts, layer_names, imobile, constructii, meta, problems):
-    """Sumar sheet, one sheet per layer with every record, and Probleme when there are any."""
+    """Sumar sheet, one sheet per layer with every record, and Probleme when there are any.
+    Returns the number of cells cut to the length an Excel cell holds."""
     wb = xlsx_report.new_workbook()
     summary = xlsx_report.Summary(wb, "Conversie CGXML")
     summary.section("Informații")
@@ -386,6 +407,7 @@ def write_xlsx(path, layouts, layer_names, imobile, constructii, meta, problems)
         xlsx_report.write_table(wb, "Probleme", ["Fișier", "Problemă"],
                                 problems, row_colors=[xlsx_report.MIXED] * len(problems))
     xlsx_report.save(wb, path)
+    return wb.cut_cells
 
 
 def conversion_facts(paths, file_count, error_count):
@@ -563,13 +585,21 @@ def write_dxf(path, layer_names, label_config, imobile, constructii, stop=_never
     """Write the DXF through a temporary file. progress receives 0 to 1. Raises Canceled,
     leaving the previous file, when stop() turns true."""
     from . import layer_style
+    # a file holds one imobil and its construcții, so the file links them; an imobil's label
+    # goes beside its construcții
+    buildings = defaultdict(list)
+    for record in constructii:
+        buildings[record.get("fisier")].extend(record.get("rings") or [])
+    obstacles = {"imobile": lambda r: buildings.get(r.get("fisier"), []),
+                 "constructii": None}
     groups = []
     # the QGIS style colors, with the nearest AutoCAD index for readers without true color
     for which, records, index in (("imobile", imobile, 6), ("constructii", constructii, 4)):
         config = label_config.get(which, [])
         groups.append((dxf_writer.cad_layer_name(layer_names[which]),
                        (index, layer_style.CADASTRAL_COLORS[which]), records,
-                       lambda r, c=config: label_lines(r, c)))
+                       lambda r, c=config: label_lines(r, c),
+                       {"obstacles": obstacles[which], "max_height": LABEL_MAX_HEIGHT[which]}))
     with replacing(path) as temporary:
         if not dxf_writer.write(temporary, groups, stop, progress):
             raise Canceled()
@@ -602,6 +632,8 @@ class ConversionTask(CadexTask):
         self.warnings = []      # (file, message), read with remarks
         self.outputs = {}       # "imobile"/"constructii" -> layer URI, "file" -> path
         self.truncated = 0
+        # cells of the Excel output cut to the length a cell holds
+        self.cut_cells = 0
         self.invalid = 0
         # Romanian sentences on the features a writer refused
         self.write_notes = []
@@ -681,9 +713,9 @@ class ConversionTask(CadexTask):
                 raise Canceled()
             path = self.output_path()
             problems = [[f, m] for f, m in self.errors + self.warnings]
-            write_xlsx(path, self.layouts, self.layer_names, self.imobile, self.constructii,
-                       conversion_facts(self.input_paths, self.file_count, len(self.errors)),
-                       problems)
+            self.cut_cells = write_xlsx(
+                path, self.layouts, self.layer_names, self.imobile, self.constructii,
+                conversion_facts(self.input_paths, self.file_count, len(self.errors)), problems)
             self.outputs["file"] = path
         self.report(100.0)
 

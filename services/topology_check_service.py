@@ -9,6 +9,9 @@ cadastral sectors. Reports only, never edits."""
 # - Generare CG rejects self-intersecting polygons and construcție vertices outside the imobil
 # - sector 0 holds the roads between sectors; roads are not snapped like the sectors, so gaps
 #   and snapping skip them and an overlap with a road is only a warning
+# - ground enclosed by imobile of several sectors belongs to no sector and can be a road that
+#   is not among the checked imobile, so a hole there is only a warning; inside the outline of
+#   a sector it is that sector's uncovered ground
 # defaults:
 # - a vertex and the segment it should lie on, both rounded to the millimetre, can end up
 #   1.4 mm apart, so 2 mm still counts as snapped
@@ -16,7 +19,9 @@ cadastral sectors. Reports only, never edits."""
 # - overlaps under 0.01 mp come from coordinate rounding
 # - so do overlaps and gaps narrower than the snapping precision, whatever their area: 1 mm
 #   along a 100 m boundary is 0.1 mp
-# - a construcție vertex more than 1 cm outside its imobil is an error, not rounding
+# - a construcție vertex more than 1 cm outside its imobil is an error, not rounding; so is
+#   ground of a construcție outside its imobil wider than 1 cm, as where a wall crosses a
+#   notch of the limit with no vertex in it
 
 import math
 import os
@@ -29,7 +34,7 @@ from qgis.core import (  # type: ignore
     QgsPolygon, QgsRectangle, QgsSpatialIndex,
 )
 
-from . import cgxml_export, cgxml_sources, fmt, stereo70, xlsx_report
+from . import cgxml_export, cgxml_sources, fmt, overlay, stereo70, xlsx_report
 from .compare_service import normalize_key
 from .tasks import CadexTask
 from ..qt_compat import FIELD_DOUBLE, FIELD_STRING, is_null
@@ -131,7 +136,17 @@ def validity_problem(geometry):
 
 
 def _cm(meters) -> str:
+    """The distance in centimetres with one decimal; under half a millimetre, where that
+    would read 0 cm, in millimetres."""
+    if meters < 0.0005:
+        return f"{fmt.number(meters * 1000, 3)} mm"
     return f"{fmt.number(meters * 100, 1)} cm"
+
+
+def _listed(names) -> str:
+    """"5", "5 și 6", "5, 6 și 7"."""
+    names = list(names)
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} și {names[-1]}"
 
 
 def polygons_of(geometry) -> Optional[QgsGeometry]:
@@ -240,6 +255,11 @@ def _sector_text(*sectors) -> str:
     return "/".join(known)
 
 
+def _in_order(sectors) -> list:
+    """The sectors by number, 2 before 10, the missing one last."""
+    return sorted(sectors, key=lambda s: (s is None, len(s or ""), s or ""))
+
+
 def _index(items):
     index = QgsSpatialIndex()
     for i, item in enumerate(items):
@@ -248,9 +268,62 @@ def _index(items):
     return index
 
 
+def _prepared(geometry):
+    """A geometry engine for repeated contains() and intersects() tests against geometry,
+    which has to stay alive as long as the engine."""
+    engine = QgsGeometry.createGeometryEngine(geometry.constGet())
+    engine.prepareGeometry()
+    return engine
+
+
 def _labels(names, limit=8):
     shown = ", ".join(names[:limit])
     return shown + (", ..." if len(names) > limit else "")
+
+
+class Coverage:
+    """The imobile of a run with what the checks compute from them once: the spatial index,
+    the union of each sector and of all sectors, a point inside each imobil, the imobile of
+    each link value. A check given a list of imobile builds its own."""
+
+    def __init__(self, parcels):
+        self.parcels = list(parcels)
+        self.index = _index(self.parcels)
+        self.sectors = {}       # sector: indexes of its imobile with a geometry
+        self.by_key = {}        # link value: indexes of its imobile
+        for i, p in enumerate(self.parcels):
+            if p.clean is not None:
+                self.sectors.setdefault(p.sector, []).append(i)
+            if p.key is not None:
+                self.by_key.setdefault(p.key, []).append(i)
+        self._unions = {}
+        self._everything = None
+        self._points = {}
+
+    def union_of(self, sector) -> QgsGeometry:
+        """The union of the imobile of a sector."""
+        if sector not in self._unions:
+            self._unions[sector] = overlay.union(
+                self.parcels[i].clean for i in self.sectors.get(sector, ()))
+        return self._unions[sector]
+
+    def everything(self, stop=_never) -> Optional[QgsGeometry]:
+        """The union of all imobile; None when no imobil has a geometry, and when stop()
+        turns true before the union is computed."""
+        if self._everything is None and self.sectors:
+            for sector in self.sectors:
+                if stop():
+                    return None
+                self.union_of(sector)
+            unions = [self._unions[sector] for sector in self.sectors]
+            self._everything = unions[0] if len(unions) == 1 else overlay.union(unions)
+        return self._everything
+
+    def point(self, i) -> QgsGeometry:
+        """A point inside the imobil with index i."""
+        if i not in self._points:
+            self._points[i] = self.parcels[i].clean.pointOnSurface()
+        return self._points[i]
 
 
 # --- checks ---
@@ -272,11 +345,11 @@ def check_invalid(items, stop: Callable[[], bool] = _never) -> List[Finding]:
     return found
 
 
-def check_overlaps(parcels, min_area=MIN_AREA, stop=_never, roads=ROADS,
+def check_overlaps(coverage, min_area=MIN_AREA, stop=_never, roads=ROADS,
                    min_width=SNAP_PRECISION) -> List[Finding]:
     """Pairs of imobile sharing more than min_area, wider than min_width somewhere; with a
     road of the roads sector only a warning."""
-    index = _index(parcels)
+    parcels, index = coverage.parcels, coverage.index
     found = []
     for i, a in enumerate(parcels):
         if stop():
@@ -289,7 +362,7 @@ def check_overlaps(parcels, min_area=MIN_AREA, stop=_never, roads=ROADS,
             b = parcels[j]
             if not a.clean.intersects(b.clean):
                 continue
-            shared = polygons_of(a.clean.intersection(b.clean))
+            shared = polygons_of(overlay.intersection(a.clean, b.clean))
             area = significant_area(shared, min_area, min_width)
             if area is None:
                 continue
@@ -316,55 +389,99 @@ def _pockets(union, width=0.0):
             yield QgsGeometry(pocket)
 
 
-def _bordering(parcels, index, geometry, reach=0.01):
+def _bordering(coverage, geometry, reach=0.01) -> list:
+    """The imobile within reach of geometry."""
     box = geometry.boundingBox()
     box.grow(reach)
-    return [parcels[k].label for k in sorted(index.intersects(box))
+    parcels = coverage.parcels
+    return [parcels[k] for k in sorted(coverage.index.intersects(box))
             if parcels[k].clean is not None and parcels[k].clean.distance(geometry) <= reach]
 
 
-def check_gaps(parcels, min_area=MIN_AREA, stop=_never, roads=ROADS,
-               min_width=SNAP_PRECISION) -> List[Finding]:
-    """Holes in a sector's union that no imobil of any sector covers, larger than min_area
-    and wider than min_width somewhere. A hole joined to the outside only by a crack narrower
-    than min_width is a hole.
-
-    An enclave or a road crossing the sector fills its hole. Uncovered ground at a sector's
-    edge needs the sector outline and is found by check_sector_limits.
-    """
-    valid = [p for p in parcels if p.clean is not None]
-    if not valid:
-        return []
-    everything = QgsGeometry.unaryUnion([p.clean for p in valid])
-    index = _index(parcels)
-    groups = defaultdict(list)
-    for p in valid:
-        if not _road(p.sector, roads):
-            groups[p.sector].append(p)
+def _uncovered_pieces(part, taken, min_area, min_width) -> list:
+    """[(piece, its area)] of part minus the geometries of taken, for the pieces that
+    significant_area() reports."""
+    box = part.boundingBox()
+    near = [geometry for geometry in taken if geometry.boundingBox().intersects(box)]
+    if near:
+        part = overlay.difference(part, overlay.union(near))
     found = []
-    for sector in sorted(groups, key=lambda s: (s is None, len(s or ""), s or "")):
-        if stop():
-            break
-        union = QgsGeometry.unaryUnion([p.clean for p in groups[sector]])
-        for pocket in _pockets(union, min_width):
-            for part in split_parts(pocket.difference(everything)):
-                area = significant_area(part, min_area, min_width)
-                if area is None:
-                    continue
-                around = _bordering(parcels, index, part)
-                if len(around) == 1:
-                    where = f" în interiorul imobilului {around[0]}"
-                elif around:
-                    where = f" între imobilele {_labels(around)}"
-                else:
-                    where = ""
-                found.append(Finding(
-                    GAP, ERROR, _sector_text(sector), "", _labels(around, 4), round(area, 4), "mp",
-                    f"Gol de {fmt.area(area, 3)}{where}.", part))
+    for piece in split_parts(part):
+        area = significant_area(piece, min_area, min_width)
+        if area is not None:
+            found.append((piece, area))
     return found
 
 
-def check_snapping(parcels, precision=SNAP_PRECISION, distance=SNAP_DISTANCE,
+def check_gaps(coverage, min_area=MIN_AREA, stop=_never, roads=ROADS,
+               min_width=SNAP_PRECISION, outlines=()) -> List[Finding]:
+    """Ground enclosed by imobile that no imobil of any sector covers, larger than min_area
+    and wider than min_width somewhere. A hole joined to the outside only by a crack narrower
+    than min_width is a hole. An enclave or a road in a hole fills it.
+
+    A hole in the union of one sector is an error. A hole that only the imobile of several
+    sectors enclose is a warning; its ground inside one of outlines, the sector outlines
+    check_sector_limits checks, is left to that check. Uncovered ground at a sector's edge
+    that the imobile do not enclose needs the sector outline too.
+    """
+    everything = coverage.everything(stop)
+    if everything is None:
+        return []
+    sectors = [s for s in _in_order(coverage.sectors) if not _road(s, roads)]
+    holes = []      # (sector, area of the sector's hole, an uncovered part of it)
+    for sector in sectors:
+        if stop():
+            return []
+        for pocket in _pockets(coverage.union_of(sector), min_width):
+            size = pocket.area()
+            holes += [(sector, size, part)
+                      for part in split_parts(overlay.difference(pocket, everything))]
+    # a sector enclosed by another lies in a hole of that other, and so do its own holes:
+    # each uncovered piece is reported once, for the smallest hole around it
+    kept, taken = {}, []
+    for n in sorted(range(len(holes)), key=lambda n: holes[n][1]):
+        kept[n] = _uncovered_pieces(holes[n][2], taken, min_area, min_width)
+        taken += [piece for piece, _area in kept[n]]
+    found = []
+    for n, (sector, _size, _part) in enumerate(holes):
+        for piece, area in kept[n]:
+            around = [p.label for p in _bordering(coverage, piece)]
+            if len(around) == 1:
+                where = f" în interiorul imobilului {around[0]}"
+            elif around:
+                where = f" între imobilele {_labels(around)}"
+            else:
+                where = ""
+            found.append(Finding(
+                GAP, ERROR, _sector_text(sector), "", _labels(around, 4), round(area, 4), "mp",
+                f"Gol de {fmt.area(area, 3)}{where}.", piece))
+    if len(sectors) < 2 or stop():
+        return found
+    ground = (everything if len(sectors) == len(coverage.sectors)
+              else overlay.union(coverage.union_of(s) for s in sectors))
+    taken += [outline.shape for outline in outlines]
+    for pocket in _pockets(ground, min_width):
+        for part in split_parts(overlay.difference(pocket, everything)):
+            for piece, area in _uncovered_pieces(part, taken, min_area, min_width):
+                around = _bordering(coverage, piece)
+                names = _in_order({p.sector for p in around
+                                   if p.sector is not None and not _road(p.sector, roads)})
+                labels = [p.label for p in around]
+                between = f" între sectoarele {_listed(names)}" if len(names) > 1 else (
+                    " între sectoare")
+                if len(labels) == 1:
+                    by = f", mărginit de imobilul {labels[0]}"
+                elif labels:
+                    by = f", mărginit de imobilele {_labels(labels)}"
+                else:
+                    by = ""
+                found.append(Finding(
+                    GAP, WARNING, _sector_text(*names), "", _labels(labels, 4), round(area, 4),
+                    "mp", f"Gol de {fmt.area(area, 3)}{between}{by}.", piece))
+    return found
+
+
+def check_snapping(coverage, precision=SNAP_PRECISION, distance=SNAP_DISTANCE,
                    stop=_never, known_gaps=None, roads=ROADS) -> List[Finding]:
     """Vertices just short of a neighbour's boundary or just inside it.
 
@@ -372,8 +489,8 @@ def check_snapping(parcels, precision=SNAP_PRECISION, distance=SNAP_DISTANCE,
     the vertex lies inside the neighbour; near a third imobil it is legitimate. The roads
     sector and gaps already in known_gaps are skipped.
     """
-    index = _index(parcels)
-    reported = QgsGeometry.unaryUnion(known_gaps) if known_gaps else None
+    parcels, index = coverage.parcels, coverage.index
+    reported = overlay.union(known_gaps) if known_gaps else None
 
     def covered(point):
         probe = QgsGeometry.fromPointXY(point)
@@ -432,97 +549,204 @@ def check_snapping(parcels, precision=SNAP_PRECISION, distance=SNAP_DISTANCE,
     return found
 
 
-def check_sector_limits(parcels, limits, min_area=MIN_AREA, stop=_never,
-                        roads=ROADS, min_width=SNAP_PRECISION) -> List[Finding]:
+@dataclass
+class Outline:
+    """A sector outline with the indexes of the imobile checked against it. sector is None
+    for an outline without a sector number that took none from the imobile inside it."""
+    sector: Optional[str]
+    shape: QgsGeometry = field(repr=False)
+    members: List[int] = field(default_factory=list)
+
+
+def _voted(coverage, shape, roads, stop) -> tuple:
+    """(the most frequent sector of the imobile with a point inside shape, the first by number
+    on a tie, None when there is none; the indexes of the roads that fill shape).
+
+    Roads cross the sectors and do not vote. They fill shape when no imobil of another
+    sector lies there and the roads sector covers more than half of it, as it does a polygon
+    of its own outline. A road in the outline of a sector that is not among the checked
+    imobile does not."""
+    engine = _prepared(shape)
+    votes, held = defaultdict(int), []
+    for i in coverage.index.intersects(shape.boundingBox()):
+        if stop():
+            return None, []
+        sector = coverage.parcels[i].sector
+        if sector is None:
+            continue
+        point = coverage.point(i)
+        if point.isNull() or not engine.contains(point.constGet()):
+            continue
+        if _road(sector, roads):
+            held.append(i)
+        else:
+            votes[sector] += 1
+    if votes:
+        most = max(votes.values())
+        return _in_order(sector for sector in votes if votes[sector] == most)[0], []
+    if held:
+        covered = polygons_of(overlay.intersection(shape, coverage.union_of(roads)))
+        if covered is not None and covered.area() > shape.area() / 2:
+            return None, held
+    return None, []
+
+
+def _most_overlapped(coverage, i, outlines, index, engines) -> Optional[int]:
+    """The position in outlines of the outline the imobil with index i overlaps most, the
+    first of them on a tie; None when it overlaps none. index holds the outlines' bounding
+    boxes, engines their prepared engines as they get made."""
+    shape = coverage.parcels[i].clean
+    candidates = sorted(index.intersects(shape.boundingBox()))
+    for n in candidates:
+        if n not in engines:
+            engines[n] = _prepared(outlines[n].shape)
+        if engines[n].contains(shape.constGet()):
+            return n
+    # an imobil that lies in an outline but for a sliver along its limit
+    inner = shape.buffer(-SNAP_PRECISION, 2)
+    if not inner.isEmpty() and inner.area() > shape.area() / 2:
+        for n in candidates:
+            if engines[n].contains(inner.constGet()):
+                return n
+    # more than half of the imobil in one outline settles it, and the outline around a point
+    # of the imobil is the likeliest
+    point = coverage.point(i)
+    if not point.isNull():
+        candidates.sort(key=lambda n: not engines[n].contains(point.constGet()))
+    best, most = None, 0.0
+    for n in candidates:
+        if not engines[n].intersects(shape.constGet()):
+            continue
+        shared = polygons_of(overlay.intersection(shape, outlines[n].shape))
+        if shared is not None and shared.area() > most:
+            best, most = n, shared.area()
+            if most > shape.area() / 2:
+                break
+    return best
+
+
+def assign_outlines(coverage, limits, roads=ROADS, stop=_never, progress=None) -> List[Outline]:
+    """The sector outlines of limits, [(sector or None, geometry)], each with its imobile.
+
+    The outlines of one sector make one outline. An outline without a sector takes the most
+    frequent sector of the imobile with a point inside it. The outlines without a sector
+    that roads fill are the outline of the roads sector when together they hold every
+    imobil of that sector. Any other outline without a sector stays on its own. The imobile
+    of an outline are those of its sector. An imobil outside the roads sector whose sector
+    has no outline belongs to the outline it overlaps most, when no imobil carries the
+    sector of that outline. progress receives 0 to 1.
+    """
+    limits = list(limits)
+    by_sector, alone, on_roads, held = defaultdict(list), [], [], set()
+    for n, (sector, geometry) in enumerate(limits):
+        if stop():
+            return []
+        shape = clean(geometry)
+        if shape is None:
+            continue
+        filling = []
+        if sector is None:
+            sector, filling = _voted(coverage, shape, roads, stop)
+        if sector is not None:
+            by_sector[sector].append(shape)
+        elif filling:
+            on_roads.append(shape)
+            held.update(filling)
+        else:
+            alone.append(shape)
+        if progress is not None:
+            progress(0.5 * (n + 1) / len(limits))
+    # outlines that hold some of the roads are not known to be the outline of the roads
+    # sector: checked against them, every other road would lie outside its sector
+    if on_roads and len(held) == len(coverage.sectors[roads]):
+        by_sector[roads] += on_roads
+    else:
+        alone += on_roads
+    outlines = []
+    for sector in _in_order(by_sector):
+        shapes = by_sector[sector]
+        outlines.append(Outline(sector, shapes[0] if len(shapes) == 1 else overlay.union(shapes),
+                                list(coverage.sectors.get(sector, ()))))
+    outlines += [Outline(None, shape) for shape in alone]
+
+    # by position: the imobile whose sector has no outline, into the outlines whose sector no
+    # imobil carries
+    unclaimed = {n for n, outline in enumerate(outlines) if not outline.members}
+    named = {outline.sector for outline in outlines if outline.sector is not None}
+    unplaced = sorted(i for sector, members in coverage.sectors.items()
+                      if sector not in named and not _road(sector, roads) for i in members)
+    if unclaimed and unplaced:
+        index, engines = QgsSpatialIndex(), {}
+        for n, outline in enumerate(outlines):
+            index.addFeature(n, outline.shape.boundingBox())
+        for done, i in enumerate(unplaced):
+            if stop():
+                return []
+            best = _most_overlapped(coverage, i, outlines, index, engines)
+            if best in unclaimed:
+                outlines[best].members.append(i)
+            if progress is not None and done % 200 == 0:
+                progress(0.5 + 0.5 * done / len(unplaced))
+    return outlines
+
+
+def check_sector_limits(coverage, outlines, known_gaps, min_area=MIN_AREA, stop=_never,
+                        min_width=SNAP_PRECISION, progress=None) -> List[Finding]:
     """Uncovered ground inside each sector outline and imobile that extend outside their
     sector, both larger than min_area and wider than min_width somewhere.
 
-    limits is [(sector or None, geometry)]; an outline without a sector takes the most
-    common sector of the imobile inside it. The imobile of an outline are those of its
-    sector; when none carries that sector, those outside the roads sector whose
-    pointOnSurface lies inside it, or on its edge when it is the outline they overlap most.
+    outlines are the ones assign_outlines() made; an outline without imobile is not checked.
+    known_gaps are the geometries of the gaps check_gaps found with these outlines, which
+    are not reported again as uncovered ground. progress receives 0 to 1.
     """
-    valid = [p for p in parcels if p.clean is not None]
-    outlines = defaultdict(list)
-    for sector, geometry in limits:
-        outline = clean(geometry)
-        if outline is None:
-            continue
-        if sector is None:
-            votes = defaultdict(int)
-            for p in valid:
-                if (p.sector is not None and not _road(p.sector, roads)
-                        and outline.contains(p.clean.pointOnSurface())):
-                    votes[p.sector] += 1
-            sector = max(votes, key=lambda s: votes[s]) if votes else None
-        outlines[sector].append(outline)
-    if not outlines:
+    checked = [outline for outline in outlines if outline.members]
+    if not checked or stop():
         return []
-    everything = QgsGeometry.unaryUnion([p.clean for p in valid]) if valid else None
-    order = sorted(outlines, key=lambda s: (s is None, len(s or ""), s or ""))
-    shapes = {sector: QgsGeometry.unaryUnion(outlines[sector]) for sector in order}
-    members = {sector: [p for p in valid if sector is not None and p.sector == sector]
-               for sector in order}
-    members.update(_members_by_place(valid, shapes, [s for s in order if not members[s]],
-                                     roads))
-
+    parcels = coverage.parcels
+    total, done = sum(len(outline.members) for outline in checked), 0
     found = []
-    for sector in order:
+    for outline in checked:
         if stop():
             break
-        outline = shapes[sector]
-        bare = outline if everything is None else outline.difference(everything)
-        # holes inside the sector's own imobile are reported by check_gaps
-        if members[sector] and not _road(sector, roads):
-            holes = list(_pockets(QgsGeometry.unaryUnion([p.clean for p in members[sector]]),
-                                  min_width))
-            if holes:
-                bare = bare.difference(QgsGeometry.unaryUnion(holes))
+        sector = outline.sector
+        bare = outline.shape
+        near = {parcels[i].sector for i in coverage.index.intersects(bare.boundingBox())}
+        # the outline's own sector first: it leaves little ground for the others
+        for other in sorted(_in_order(near), key=lambda s: s != sector):
+            if bare.isEmpty() or stop():
+                break
+            bare = overlay.difference(bare, coverage.union_of(other))
         where = f"din sectorul {sector}" if sector is not None else "din limita sectorului"
-        for part in split_parts(bare):
-            area = significant_area(part, min_area, min_width)
-            if area is not None:
-                found.append(Finding(
-                    UNCOVERED, ERROR, _sector_text(sector), "", "", round(area, 4), "mp",
-                    f"Suprafață de {fmt.area(area, 3)} {where}, neacoperită de niciun imobil.",
-                    part))
+        for part, area in _uncovered_pieces(bare, known_gaps, min_area, min_width):
+            found.append(Finding(
+                UNCOVERED, ERROR, _sector_text(sector), "", "", round(area, 4), "mp",
+                f"Suprafață de {fmt.area(area, 3)} {where}, neacoperită de niciun imobil.",
+                part))
         limit = f"limita sectorului {sector}" if sector is not None else "limita sectorului"
-        for p in members[sector]:
-            out = polygons_of(p.clean.difference(outline))
+        engine = _prepared(outline.shape)
+        for i in outline.members:
+            if stop():
+                break
+            done += 1
+            if progress is not None and done % 100 == 0:
+                progress(done / total)
+            p = parcels[i]
+            if engine.contains(p.clean.constGet()):
+                continue
+            # moved inward by half the width and inside the outline: what the imobil has
+            # outside is narrower than the width
+            inner = p.clean.buffer(-min_width / 2, 2) if min_width > 0 else None
+            if inner is not None and not inner.isEmpty() and engine.contains(inner.constGet()):
+                continue
+            out = polygons_of(overlay.difference(p.clean, outline.shape))
             area = significant_area(out, min_area, min_width)
             if area is not None:
                 found.append(Finding(
                     OUTSIDE_SECTOR, ERROR, _sector_text(sector), p.name, "", round(area, 4),
                     "mp", f"Imobilul {p.label} iese din {limit} cu {fmt.area(area, 3)}.", out))
+        if progress is not None:
+            progress(done / total)
     return found
-
-
-def _members_by_place(parcels, shapes, sectors, roads) -> dict:
-    """{sector: imobile} for the given sectors of shapes ({sector: outline}): the imobile
-    outside the roads sector whose pointOnSurface lies inside the sector's outline. When the
-    point lies on the edge of one of these outlines and inside none of them, the imobil
-    belongs to the outline of shapes it overlaps most (the first in shapes' order on a tie),
-    and counts here only when that is one of the given sectors."""
-    members = {sector: [] for sector in sectors}
-    if not members:
-        return members
-    for p in parcels:
-        if _road(p.sector, roads):
-            continue
-        point = p.clean.pointOnSurface()
-        inside = [sector for sector in sectors if shapes[sector].contains(point)]
-        if not inside and any(shapes[sector].intersects(point) for sector in sectors):
-            edge = [sector for sector, outline in shapes.items() if outline.intersects(point)]
-            best = max(edge, key=lambda s: _overlap_area(p.clean, shapes[s]))
-            inside = [best] if best in members else []
-        for sector in inside:
-            members[sector].append(p)
-    return members
-
-
-def _overlap_area(a, b) -> float:
-    shared = polygons_of(a.intersection(b))
-    return shared.area() if shared is not None else 0.0
 
 
 def unmatched_sectors(parcels, limits) -> List[str]:
@@ -534,50 +758,95 @@ def unmatched_sectors(parcels, limits) -> List[str]:
                   key=lambda s: (len(s), s))
 
 
-def place_buildings(buildings, parcels, stop=_never):
-    """Find the imobil of each building, from the CGXML file, else the link value, else the
-    largest overlap, and the imobile it covers. Each building gets its Placement and its
-    imobil's sector; check_buildings reuses them."""
-    index = _index(parcels)
-    by_key = defaultdict(list)
-    for i, p in enumerate(parcels):
-        if p.key is not None:
-            by_key[p.key].append(i)
+def placement(building, coverage) -> Placement:
+    """The imobil of a building with a valid geometry, from its CGXML file, else its link
+    value, else the largest overlap, and the imobile it covers. Verificare Topologică and
+    Topologie Construcții both place a construcție with it."""
+    parcels = coverage.parcels
+    cover = {}
+    for j in coverage.index.intersects(building.clean.boundingBox()):
+        if parcels[j].clean is not None and parcels[j].clean.intersects(building.clean):
+            shared = polygons_of(overlay.intersection(parcels[j].clean, building.clean))
+            if shared is not None and shared.area() > 0:
+                cover[j] = shared.area()
+    own, link_found = building.parcel, True
+    if own is None and building.link is not None:
+        matches = coverage.by_key.get(building.link, [])
+        if matches:
+            own = max(matches, key=lambda j: cover.get(j, 0.0))
+        else:
+            link_found = False
+    if own is None and cover:
+        own = max(cover, key=lambda j: cover[j])
+    best = max(cover, key=lambda j: cover[j]) if cover else None
+    return Placement(own, best, cover, link_found)
+
+
+def farthest_outside(geometry, parcel) -> tuple:
+    """(how far the farthest point of geometry lies outside the polygon parcel, that point as
+    a geometry), (0.0, None) when no point lies outside. A point nearer than the overlay grid
+    is on the limit: a point computed on a limit misses it by less."""
+    worst, where = 0.0, None
+    for vertex in geometry.vertices():
+        probe = QgsGeometry.fromPointXY(QgsPointXY(vertex.x(), vertex.y()))
+        if parcel.intersects(probe):
+            continue
+        gap = parcel.distance(probe)
+        if gap > max(worst, overlay.GRID):
+            worst, where = gap, probe
+    return worst, where
+
+
+# how a construcție lies outside its imobil: distance and point as farthest_outside() gives
+# them, ground the part of it outside the imobil, None without any, and the area of that part
+Outside = namedtuple("Outside", "distance point ground area")
+
+
+def outside(geometry, parcel, tolerance, valid=None) -> Optional[Outside]:
+    """How the construcție geometry lies outside the polygon parcel, None when it does not.
+    Verificare Topologică reports a construcție by this rule and Topologie Construcții cuts
+    it by the same.
+
+    It lies outside when one of its points is more than tolerance outside the imobil, the
+    test Generare CG makes, or when its ground outside the imobil is wider than tolerance
+    somewhere: a wall across a notch of the limit puts ground there and no point. Ground
+    that shrinking by half the tolerance removes is within the tolerance, and a strip
+    narrower than two steps of the overlay grid comes from the grid. valid is the valid copy
+    of an invalid geometry, for the overlay.
+    """
+    if geometry.within(parcel):
+        return None
+    distance, point = farthest_outside(geometry, parcel)
+    ground = polygons_of(overlay.difference(geometry if valid is None else valid, parcel))
+    if distance <= tolerance and (
+            ground is None or ground.buffer(-max(tolerance / 2, overlay.GRID), 2).isEmpty()):
+        return None
+    return Outside(distance, point, ground, ground.area() if ground is not None else 0.0)
+
+
+def place_buildings(buildings, coverage, stop=_never):
+    """Give each building its Placement and the sector of its imobil; check_buildings reuses
+    them."""
     for b in buildings:
         if stop():
             break
         if b.clean is None or b.placement is not None:
             continue
-        cover = {}
-        for j in index.intersects(b.clean.boundingBox()):
-            if parcels[j].clean is not None and parcels[j].clean.intersects(b.clean):
-                shared = polygons_of(parcels[j].clean.intersection(b.clean))
-                if shared is not None and shared.area() > 0:
-                    cover[j] = shared.area()
-        own, link_found = b.parcel, True
-        if own is None and b.link is not None:
-            matches = by_key.get(b.link, [])
-            if matches:
-                own = max(matches, key=lambda j: cover.get(j, 0.0))
-            else:
-                link_found = False
-        if own is None and cover:
-            own = max(cover, key=lambda j: cover[j])
-        best = max(cover, key=lambda j: cover[j]) if cover else None
-        b.placement = Placement(own, best, cover, link_found)
+        b.placement = placement(b, coverage)
+        own = b.placement.own
         if b.sector is None and own is not None:
-            b.sector = parcels[own].sector
+            b.sector = coverage.parcels[own].sector
 
 
-def check_buildings(buildings, parcels, tolerance=BUILDING_TOLERANCE,
+def check_buildings(buildings, coverage, tolerance=BUILDING_TOLERANCE,
                     min_area=MIN_AREA, stop=_never, min_width=SNAP_PRECISION) -> List[Finding]:
     """Construcții outside their imobil, on another imobil, on none, or overlapping.
 
-    The imobil comes from the CGXML file, else the link value, else the largest overlap. Like
-    Generare CG, a construcție is outside its imobil when one of its points lies more than
-    tolerance outside it.
+    The imobil comes from the CGXML file, else the link value, else the largest overlap. A
+    construcție is outside its imobil by the rule of outside().
     """
-    place_buildings(buildings, parcels, stop)
+    parcels = coverage.parcels
+    place_buildings(buildings, coverage, stop)
     found = []
     for b in buildings:
         if stop():
@@ -605,7 +874,7 @@ def check_buildings(buildings, parcels, tolerance=BUILDING_TOLERANCE,
             continue
         if best != own and cover[best] > cover.get(own, 0.0):
             other = parcels[best]
-            on_other = polygons_of(other.clean.intersection(b.clean))
+            on_other = polygons_of(overlay.intersection(other.clean, b.clean))
             found.append(Finding(
                 BUILDING_ELSEWHERE, ERROR, _sector_text(parcel.sector), b.name, other.name,
                 round(cover[best], 4), "mp",
@@ -613,27 +882,24 @@ def check_buildings(buildings, parcels, tolerance=BUILDING_TOLERANCE,
                 f"mai mare parte pe imobilul {other.label} ({fmt.area(cover[best], 2)} din "
                 f"{fmt.area(b.clean.area(), 2)}).", on_other or b.clean))
             continue
-        worst, worst_point = 0.0, None
-        for vertex in b.geometry.vertices():
-            probe = QgsGeometry.fromPointXY(QgsPointXY(vertex.x(), vertex.y()))
-            if parcel.clean.intersects(probe):
-                continue
-            gap = parcel.clean.distance(probe)
-            if gap > worst:
-                worst, worst_point = gap, probe
-        if worst <= tolerance:
+        out = outside(b.geometry, parcel.clean, tolerance, b.clean)
+        if out is None:
             continue
-        outside = polygons_of(b.clean.difference(parcel.clean))
-        area = outside.area() if outside is not None else 0.0
         # the imobil the outside part lies on most, if any
         neighbours = [j for j in cover if j != own]
         other = parcels[max(neighbours, key=lambda j: cover[j])].name if neighbours else ""
+        if out.distance > tolerance:
+            value, unit = round(out.distance, 4), "m"
+            detail = (f"Un punct al construcției {b.label} iese din imobilul {parcel.label} cu "
+                      f"{_cm(out.distance)} ({fmt.area(out.area, 3)} în afară).")
+        else:
+            # ground outside the imobil and no point there: there is no distance to give
+            value, unit = round(out.area, 4), "mp"
+            detail = (f"O latură a construcției {b.label} iese din imobilul {parcel.label} "
+                      f"({fmt.area(out.area, 3)} în afară).")
         found.append(Finding(
-            BUILDING_OUTSIDE, ERROR, _sector_text(parcel.sector), b.name, other,
-            round(worst, 4), "m",
-            f"Un punct al construcției {b.label} iese din imobilul {parcel.label} cu "
-            f"{_cm(worst)} ({fmt.area(area, 3)} în afară).",
-            outside if outside is not None and area > 1e-6 else worst_point))
+            BUILDING_OUTSIDE, ERROR, _sector_text(parcel.sector), b.name, other, value, unit,
+            detail, out.point if out.point is not None and out.area <= 1e-6 else out.ground))
 
     bindex = _index(buildings)
     for i, a in enumerate(buildings):
@@ -647,7 +913,7 @@ def check_buildings(buildings, parcels, tolerance=BUILDING_TOLERANCE,
             b = buildings[j]
             if not a.clean.intersects(b.clean):
                 continue
-            shared = polygons_of(a.clean.intersection(b.clean))
+            shared = polygons_of(overlay.intersection(a.clean, b.clean))
             area = significant_area(shared, min_area, min_width)
             if area is not None:
                 found.append(Finding(
@@ -660,6 +926,11 @@ def check_buildings(buildings, parcels, tolerance=BUILDING_TOLERANCE,
 
 # --- inputs ---
 
+def unnamed(snapshot, feature) -> str:
+    """The name in the results of a feature without an ID: its layer and row number."""
+    return f"{snapshot.name} #{feature.id()}"
+
+
 def parcels_from_layers(snapshots, id_field=None, sector_field=None, empty=None):
     """Parcels from snapshots, labelled "<layer> #<fid>" without an id_field. empty, a list,
     receives the label of each feature without geometry, which is not checked."""
@@ -670,7 +941,7 @@ def parcels_from_layers(snapshots, id_field=None, sector_field=None, empty=None)
         for feature, geometry in snapshot.features(with_empty=True):
             values = feature.attributes()
             key = normalize_key(values[id_index]) if id_index >= 0 else None
-            label = key or f"{snapshot.name} #{feature.id()}"
+            label = key or unnamed(snapshot, feature)
             if geometry is None:
                 if empty is not None:
                     empty.append(label)
@@ -695,9 +966,9 @@ def buildings_from_layers(snapshots, link_field=None, number_field=None, empty=N
             if link and number:
                 label = f"{link} {number}"
             elif number:
-                label = f"{snapshot.name} #{feature.id()} ({number})"
+                label = f"{unnamed(snapshot, feature)} ({number})"
             else:
-                label = f"{snapshot.name} #{feature.id()}"
+                label = unnamed(snapshot, feature)
             if geometry is None:
                 if empty is not None:
                     empty.append(label)
@@ -748,7 +1019,7 @@ def _same_place(a, b) -> bool:
     a, b = clean(a), clean(b)
     if a is None or b is None:
         return False
-    shared = polygons_of(a.intersection(b))
+    shared = polygons_of(overlay.intersection(a, b))
     smaller = min(a.area(), b.area())
     return shared is not None and smaller > 0 and shared.area() >= smaller / 2
 
@@ -914,8 +1185,9 @@ def write_excel(path, findings, facts):
 class TopologyCheckTask(CadexTask):
     """The checks as a background task, on layer snapshots or CGXML paths. Findings are in
     Stereo 70. facts are the Excel Sumar's lines on the sources; the task adds the
-    tolerances and the counts. With stop_if_nothing_read, a run on CGXML paths where no file
-    could be read fails before any check and before the report is written."""
+    tolerances and the counts. With stop_if_nothing_read, a run that has no imobil to check
+    fails before any check and before the report is written: CGXML paths where no imobil
+    with coordinates could be read, imobile layers without a feature with geometry."""
 
     def __init__(self, *, imobile=None, constructii=None, id_field=None, sector_field=None,
                  link_field=None, number_field=None, cgxml_paths=None, recursive=True,
@@ -952,6 +1224,7 @@ class TopologyCheckTask(CadexTask):
         self.duplicates = []            # (imobil, [files, the checked one first])
         self.reused_keys = []           # (imobil, [files of different imobile, each checked])
         self.unmatched_sectors = []     # outline sectors no imobil carries
+        self.empty_outlines = 0         # outlines without a sector and without imobile
         self.parcel_count = 0
         self.building_count = 0
         self.sector_count = 0
@@ -965,10 +1238,8 @@ class TopologyCheckTask(CadexTask):
                 (parcels, buildings, self.read_errors, self.skipped, self.duplicates,
                  self.reused_keys) = from_cgxml(self.cgxml_paths, self.recursive, self.stopped,
                                                 lambda share: self.report(30.0 * share))
-                # every file read gives an imobil or a record without coordinates
-                if (self.stop_if_nothing_read and self.read_errors and not parcels
-                        and not self.skipped):
-                    self.error_msg = cgxml_export.nothing_read(self.read_errors)
+                if self.stop_if_nothing_read and not parcels:
+                    self.error_msg = self._no_imobil_read()
                     return False
             else:
                 empty = []
@@ -977,6 +1248,9 @@ class TopologyCheckTask(CadexTask):
                 buildings = buildings_from_layers(self.constructii, self.link_field,
                                                   self.number_field, empty)
                 self.skipped = len(empty)
+                if self.stop_if_nothing_read and not parcels:
+                    self.error_msg = self._no_imobil()
+                    return False
             if self.stopped():
                 return False
             self.parcel_count = len(parcels)
@@ -986,21 +1260,32 @@ class TopologyCheckTask(CadexTask):
             self.report(30)
 
             stop = self.stopped
+            coverage = Coverage(parcels)
             self._add(check_invalid(parcels, stop), 1)
-            place_buildings(buildings, parcels, stop)
+            place_buildings(buildings, coverage, stop)
             self._add(check_invalid(buildings, stop), 2)
             width = self.snap_precision
-            self._add(check_overlaps(parcels, self.min_area, stop, roads=self.roads,
+            self._add(check_overlaps(coverage, self.min_area, stop, roads=self.roads,
                                      min_width=width), 3)
-            gaps = check_gaps(parcels, self.min_area, stop, roads=self.roads, min_width=width)
+            limits = self._limit_outlines()
+            self.unmatched_sectors = unmatched_sectors(parcels, limits)
+            outlines = assign_outlines(coverage, limits, self.roads, stop,
+                                       lambda share: self._within(3, share / 2))
+            self.empty_outlines = sum(1 for outline in outlines
+                                      if outline.sector is None and not outline.members)
+            gaps = check_gaps(coverage, self.min_area, stop, roads=self.roads, min_width=width,
+                              outlines=[outline for outline in outlines if outline.members])
             self._add(gaps, 4)
-            self._add(check_snapping(parcels, self.snap_precision, self.snap_distance, stop,
-                                     [g.geometry for g in gaps], roads=self.roads), 5)
-            outlines = self._limit_outlines()
-            self.unmatched_sectors = unmatched_sectors(parcels, outlines)
-            self._add(check_sector_limits(parcels, outlines, self.min_area, stop,
-                                          roads=self.roads, min_width=width), 6)
-            self._add(check_buildings(buildings, parcels, self.building_tolerance,
+            known = [gap.geometry for gap in gaps]
+            # a point within the snapping distance of its neighbour is an error also where
+            # the gap between them, lying between sectors, is only a warning
+            errors = [gap.geometry for gap in gaps if gap.severity == ERROR]
+            self._add(check_snapping(coverage, self.snap_precision, self.snap_distance, stop,
+                                     errors, roads=self.roads), 5)
+            self._add(check_sector_limits(coverage, outlines, known, self.min_area, stop,
+                                          min_width=width,
+                                          progress=lambda share: self._within(5, share)), 6)
+            self._add(check_buildings(buildings, coverage, self.building_tolerance,
                                       self.min_area, stop, min_width=width), 7)
             if stop():
                 return False
@@ -1021,8 +1306,7 @@ class TopologyCheckTask(CadexTask):
             ("Suprafață minimă", fmt.area(self.min_area, 3)),
             ("Toleranță de racordare", metres(self.snap_precision)),
             ("Distanță de racordare", metres(self.snap_distance)),
-            ("Cât poate ieși un punct al construcției din imobil",
-             metres(self.building_tolerance)),
+            ("Cât poate ieși construcția din imobil", metres(self.building_tolerance)),
             ("Sectorul drumurilor", self.roads or "-"),
         ]
         if self.limits is not None:
@@ -1037,7 +1321,8 @@ class TopologyCheckTask(CadexTask):
     def notes(self) -> List[str]:
         """Romanian sentences on what the run left out or compared differently: features or
         records without geometry, imobile found in several files, IDs or IEs shared by
-        different imobile, outline sectors that no imobil carries."""
+        different imobile, outline sectors that no imobil carries, outlines without a sector
+        that hold no imobil."""
         notes = []
         if self.skipped and self.cgxml_paths:
             notes.append(fmt.plural(
@@ -1068,13 +1353,52 @@ class TopologyCheckTask(CadexTask):
                 len(self.unmatched_sectors), "Sectorul {0} din limite nu apare la niciun imobil.",
                 "Sectoarele {0} din limite nu apar la niciun imobil.").format(
                     ", ".join(self.unmatched_sectors)))
+        if self.empty_outlines:
+            notes.append(fmt.plural(
+                self.empty_outlines,
+                "O limită de sector nu cuprinde niciun imobil și nu a fost verificată.",
+                "{0} nu cuprind niciun imobil și nu au fost verificate.").format(
+                    fmt.count(self.empty_outlines, "limită de sector", "limite de sector")))
         return notes
+
+    def _no_imobil_read(self) -> str:
+        """The reason a run on CGXML sources without an imobil to check stops."""
+        # every file read gives an imobil or a record without coordinates
+        if self.read_errors and not self.skipped:
+            return cgxml_export.nothing_read(self.read_errors)
+        reason = fmt.plural(
+            len(self.cgxml_paths),
+            "Niciun imobil nu a putut fi verificat: sursa aleasă nu are niciun imobil cu "
+            "coordonate.",
+            "Niciun imobil nu a putut fi verificat: sursele alese nu au niciun imobil cu "
+            "coordonate.")
+        if self.read_errors:
+            reason += " " + fmt.plural(
+                len(self.read_errors), "{0} nu a putut fi citit:",
+                "{0} nu au putut fi citite:").format(
+                    fmt.count(len(self.read_errors), "fișier", "fișiere"))
+            reason += "\n\n" + cgxml_export.problem_lines(self.read_errors)
+        return reason
+
+    def _no_imobil(self) -> str:
+        """The reason a run on layers without an imobil to check stops."""
+        names = ", ".join(f"'{snapshot.name}'" for snapshot in self.imobile)
+        return fmt.plural(
+            len(self.imobile),
+            "Niciun imobil nu a putut fi verificat: layerul {0} nu are niciun element cu "
+            "geometrie.",
+            "Niciun imobil nu a putut fi verificat: layerele {0} nu au niciun element cu "
+            "geometrie.").format(names)
 
     STEPS = 7
 
     def _add(self, findings, step):
         self.findings.extend(findings)
-        self.report(30.0 + 65.0 * step / self.STEPS)
+        self._within(step, 0.0)
+
+    def _within(self, step, share):
+        """Report the progress share, 0 to 1, into the check that follows step."""
+        self.report(30.0 + 65.0 * (step + share) / self.STEPS)
 
     def _limit_outlines(self):
         outlines = []

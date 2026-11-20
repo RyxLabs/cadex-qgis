@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: 2026 RYXLAB SOFT TECH SRL (RyxLabs)
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Source rules: license headers, Qt6-compatible spellings, catalog entries with methods and
-icons, complete metadata, dark icons generated from the light ones. No QgsApplication."""
+icons, complete metadata, the changelog of the version, dark icons generated from the light
+ones. No QgsApplication."""
 
 import ast
 import configparser
@@ -251,6 +252,28 @@ class MetadataTests(unittest.TestCase):
 
     def test_siruta_database_ships(self):
         self.assertTrue(os.path.isfile(os.path.join(ROOT, "data", "siruta.db")))
+
+
+class ChangelogTests(unittest.TestCase):
+    """CHANGELOG.md, whose newest section is what the Plugin Manager shows for the version and
+    the notes of its GitHub release."""
+
+    def setUp(self):
+        self.release_notes = helpers.github_script("release_notes")
+        self.version, _dated, self.body = self.release_notes.sections(
+            read(os.path.join(ROOT, "CHANGELOG.md")))[0]
+        parser = configparser.ConfigParser()
+        parser.read(os.path.join(ROOT, "metadata.txt"), encoding="utf-8")
+        self.general = parser["general"]
+
+    def test_the_newest_section_is_the_version_of_the_plugin(self):
+        self.assertEqual(self.version, self.general["version"])
+
+    def test_the_plugin_manager_shows_the_entries_of_the_newest_section(self):
+        listed = self.release_notes.entries(self.body)
+        self.assertTrue(listed)
+        shown = self.release_notes.metadata_changelog(self.general["changelog"])
+        self.assertEqual(shown.get(self.version), listed)
 
 
 if __name__ == "__main__":

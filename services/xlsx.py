@@ -15,7 +15,12 @@ import re
 # entity expansion
 import xml.etree.ElementTree as ET  # nosec B405
 import zipfile
+from collections import Counter
+from datetime import datetime, timedelta
 from html import escape
+from typing import NamedTuple
+
+from . import fmt
 
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -26,12 +31,18 @@ SPREADSHEET_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml"
 # built-in number formats, no numFmt entry needed
 BUILTIN_FORMATS = {"General": 0, "0": 1, "0.00": 2, "#,##0": 3, "#,##0.00": 4, "@": 49}
 
-_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# what an XML 1.0 file cannot hold: the control characters other than tab, line feed and
+# carriage return, the halves of a surrogate pair, U+FFFE and U+FFFF
+_NOT_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 _SHEET_BAD = re.compile(r"[\[\]:*?/\\]")
+_LINE_SPACE = re.compile(r"[\t\r\n]")
 _CELL_REF = re.compile(r"([A-Z]+)(\d+)")
 
+# Excel's limits; it counts the length of a text in UTF-16 units
 MAX_SHEET_NAME = 31
-MAX_CELL_TEXT = 32767  # Excel's limit per cell
+MAX_CELL_TEXT = 32767
+MAX_ROWS = 1048576
+MAX_COLUMNS = 16384
 
 
 def column_letter(index: int) -> str:
@@ -51,17 +62,42 @@ def column_index(letters: str) -> int:
     return index
 
 
+def clean_text(value: str) -> str:
+    """value with a space in place of every character an XML file cannot hold."""
+    return _NOT_XML.sub(" ", value)
+
+
+def utf16_cut(text: str, units: int) -> str:
+    """text cut to at most units UTF-16 units; a character outside the basic plane counts as
+    two and is not cut in half."""
+    if len(text) * 2 <= units:
+        return text
+    count = 0
+    for position, char in enumerate(text):
+        count += 2 if char > "\uffff" else 1
+        if count > units:
+            return text[:position]
+    return text
+
+
 def sheet_name(text: str) -> str:
-    """A valid worksheet name: none of []:*?/\\, at most 31 characters, not empty."""
-    return _SHEET_BAD.sub("-", str(text))[:MAX_SHEET_NAME].strip("'") or "Foaie"
+    """A valid worksheet name: none of []:*?/\\, one line, at most 31 UTF-16 units, no
+    apostrophe at either end, not empty."""
+    name = _SHEET_BAD.sub("-", _LINE_SPACE.sub(" ", clean_text(str(text))))
+    return utf16_cut(name, MAX_SHEET_NAME).strip("'") or "Foaie"
 
 
 def _xml_text(value: str) -> str:
-    return escape(_CONTROL.sub(" ", value)[:MAX_CELL_TEXT], quote=False)
+    return escape(utf16_cut(clean_text(value), MAX_CELL_TEXT), quote=False)
 
 
 def _attr(value: str) -> str:
-    return escape(str(value))
+    return escape(clean_text(str(value)))
+
+
+class SheetTooLarge(OSError):
+    """A sheet with more rows or columns than Excel holds. An OSError, so that a tool reports
+    it as a report file it could not write."""
 
 
 class _Styles:
@@ -73,6 +109,8 @@ class _Styles:
         self.borders: list = [None]
         self.formats: dict = {}
         self.xfs: list = [(0, 0, 0, 0, None)]
+        # get()'s arguments -> cell format id; a report asks for the same few once per cell
+        self._ids: dict = {}
 
     def _index(self, items, item):
         if item not in items:
@@ -81,6 +119,12 @@ class _Styles:
 
     def get(self, *, bold=False, italic=False, color="", size=11.0, fill=None,
             border=None, halign=None, valign=None, wrap=False, number=None):
+        key = (bold, italic, color, size, fill, border, halign, valign, wrap, number)
+        if key not in self._ids:
+            self._ids[key] = self._add(*key)
+        return self._ids[key]
+
+    def _add(self, bold, italic, color, size, fill, border, halign, valign, wrap, number):
         font = self._index(self.fonts, (color or "", bool(bold), bool(italic), float(size)))
         fill_id = self._index(self.fills, fill) if fill else 0
         border_id = self._index(self.borders, border) if border else 0
@@ -153,8 +197,9 @@ class _Styles:
 
 class Sheet:
 
-    def __init__(self, name):
+    def __init__(self, name, book):
         self.name = name
+        self.book = book         # the Workbook that counts the cells cut short
         self.cells = {}          # (row, col) -> (value, style id)
         self.widths = {}         # col -> characters
         self.heights = {}        # row -> points
@@ -166,6 +211,12 @@ class Sheet:
         self.fit_width = False
 
     def set(self, row, col, value, style=0):
+        """A text longer than a cell holds is cut to MAX_CELL_TEXT and counted in the
+        workbook's cut_cells."""
+        if isinstance(value, str) and len(value) * 2 > MAX_CELL_TEXT:
+            whole, value = value, utf16_cut(value, MAX_CELL_TEXT)
+            if len(value) < len(whole):
+                self.book.cut_cells += 1
         self.cells[(row, col)] = (value, style)
 
     def merge(self, first_row, first_col, last_row, last_col):
@@ -256,6 +307,8 @@ class Workbook:
     def __init__(self):
         self.sheets = []
         self.styles = _Styles()
+        # how many cells hold a text cut to MAX_CELL_TEXT, for the caller to report
+        self.cut_cells = 0
 
     def style(self, **kwargs) -> int:
         return self.styles.get(**kwargs)
@@ -266,9 +319,9 @@ class Workbook:
         unique, n = base, 2
         while unique.lower() in taken:
             suffix = f" ({n})"
-            unique = base[:MAX_SHEET_NAME - len(suffix)] + suffix
+            unique = utf16_cut(base, MAX_SHEET_NAME - len(suffix)) + suffix
             n += 1
-        sheet = Sheet(unique)
+        sheet = Sheet(unique, self)
         if index is None:
             self.sheets.append(sheet)
         else:
@@ -277,9 +330,11 @@ class Workbook:
 
     def save(self, path):
         """Write the workbook to a temporary file in path's folder, then move it onto path:
-        when writing fails, the file already at path stays whole. An error names path."""
+        when writing fails, the file already at path stays whole. An error names path. A
+        sheet larger than Excel holds raises SheetTooLarge before anything is written."""
         if not self.sheets:
             self.add_sheet("Foaie")
+        self._refuse_too_large()
         temporary = f"{path}.{os.getpid()}.tmp"
         try:
             with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -295,6 +350,16 @@ class Workbook:
         except BaseException:
             _remove(temporary)
             raise
+
+    def _refuse_too_large(self):
+        # the text ends outputs.write_error's sentence "Fișierul '...' nu poate fi scris: "
+        for sheet in self.sheets:
+            for size, limit, one, many in ((sheet.max_row, MAX_ROWS, "rând", "rânduri"),
+                                           (sheet.max_col, MAX_COLUMNS, "coloană", "coloane")):
+                if size > limit:
+                    raise SheetTooLarge(
+                        f"foaia '{sheet.name}' are {fmt.count(size, one, many)}, iar o foaie "
+                        f"Excel cuprinde cel mult {fmt.number(limit, 0)}")
 
     def _write_parts(self, zf):
         count = len(self.sheets)
@@ -389,53 +454,104 @@ def _shared_strings(zf):
     return strings
 
 
-def _sheet_paths(zf):
-    """[(sheet name, path inside the zip)] in workbook order."""
+class Percent(float):
+    """A number that its cell shows as a percentage: 0.25 with number_format "0%" is 25%."""
+
+    def __new__(cls, value, number_format="0%"):
+        number = super().__new__(cls, value)
+        number.number_format = number_format
+        return number
+
+
+class _Sheet(NamedTuple):
+    name: str
+    path: str      # of its part inside the zip
+    shown: bool    # a worksheet Excel shows: not hidden, and not a chart or macro sheet
+
+
+class _Book(NamedTuple):
+    sheets: list     # of _Sheet, in tab order
+    styles: str      # the path of the styles part
+    date1904: bool   # days counted from 1904, as in a workbook begun on a Mac
+
+
+def _book(zf) -> _Book:
     workbook = ET.fromstring(zf.read("xl/workbook.xml"))  # nosec B314
     rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))  # nosec B314
-    targets = {}
+    targets, styles = {}, "xl/styles.xml"
     for rel in rels:
         target = rel.get("Target", "")
         target = target.lstrip("/") if target.startswith("/") else "xl/" + target
-        targets[rel.get("Id")] = target
-    result = []
+        kind = rel.get("Type", "").rsplit("/", 1)[-1]
+        targets[rel.get("Id")] = (target, kind)
+        if kind == "styles":
+            styles = target
+    sheets, date1904 = [], False
     for element in workbook.iter():
-        if _local(element.tag) == "sheet":
+        name = _local(element.tag)
+        if name == "workbookPr":
+            date1904 = element.get("date1904") in ("1", "true")
+        elif name == "sheet":
             rid = next((v for k, v in element.attrib.items() if _local(k) == "id"), None)
             if rid in targets:
-                result.append((element.get("name"), targets[rid]))
-    return result
+                target, kind = targets[rid]
+                shown = (kind == "worksheet"
+                         and element.get("state") not in ("hidden", "veryHidden"))
+                sheets.append(_Sheet(element.get("name"), target, shown))
+    return _Book(sheets, styles, date1904)
+
+
+def _chosen(sheets, name=None):
+    """The sheet called name, else the first one Excel shows, since a hidden sheet or a chart
+    can come first, else the first; None for a workbook without sheets."""
+    return (next((s for s in sheets if s.name == name), None)
+            or next((s for s in sheets if s.shown), None)
+            or (sheets[0] if sheets else None))
 
 
 def sheet_names(path):
     if path.lower().endswith(".csv"):
         return ["CSV"]
     with zipfile.ZipFile(path) as zf:
-        return [name for name, _p in _sheet_paths(zf)]
+        return [sheet.name for sheet in _book(zf).sheets]
+
+
+def default_sheet(path):
+    """The name of the sheet read_table() reads when none is named, None for a workbook
+    without sheets."""
+    if path.lower().endswith(".csv"):
+        return "CSV"
+    with zipfile.ZipFile(path) as zf:
+        sheet = _chosen(_book(zf).sheets)
+    return sheet.name if sheet else None
 
 
 def read_rows(path, sheet=None):
-    """(sheet names, rows) of an .xlsx or .csv. Rows are lists of str, float or None, all as
-    wide as the widest; empty rows are kept, so row numbers match Excel's."""
+    """(sheet names, rows) of an .xlsx or .csv. Rows are lists of cell values, None for an
+    empty cell, all as wide as the widest row of values; the empty rows above the last value
+    are kept, so row numbers match Excel's. A value is a str, a bool, a float, or what the
+    cell's format shows of its number: a date, a datetime or a time, or a Percent."""
     names, rows, _hidden = read_table(path, sheet)
     return names, rows
 
 
 def read_table(path, sheet=None):
     """(sheet names, rows, hidden row numbers): read_rows() and the Excel numbers (from 1) of
-    the rows hidden in the sheet, by a filter or by hand. A CSV has no hidden rows."""
+    the rows hidden in the sheet, by a filter or by hand. A CSV has no hidden rows. Without
+    sheet, or with a name the workbook lacks, the sheet read is default_sheet()."""
     if path.lower().endswith(".csv"):
         return ["CSV"], _read_csv(path), []
     with zipfile.ZipFile(path) as zf:
-        sheets = _sheet_paths(zf)
-        if not sheets:
+        book = _book(zf)
+        chosen = _chosen(book.sheets, sheet)
+        if chosen is None:
             return [], [], []
-        names = [name for name, _p in sheets]
-        target = dict(sheets).get(sheet) or sheets[0][1]
+        names = [s.name for s in book.sheets]
         shared = _shared_strings(zf)
+        formats = _cell_formats(zf, book.styles)
         rows = {}
         hidden = []
-        with zf.open(target) as fp:
+        with zf.open(chosen.path) as fp:
             next_row = 0
             for _event, element in ET.iterparse(fp):  # nosec B314
                 if _local(element.tag) != "row":
@@ -451,16 +567,21 @@ def read_table(path, sheet=None):
                     ref = cell.get("r")
                     match = _CELL_REF.match(ref or "")
                     next_col = column_index(match.group(1)) if match else next_col + 1
-                    values[next_col] = _cell_value(cell, shared)
-                rows[next_row] = values
+                    value = _cell_value(cell, shared, formats, book.date1904)
+                    # a cell that holds only a format is not part of the table: one such
+                    # cell in the last column would make every row 16,384 cells wide
+                    if value is not None and value != "":
+                        values[next_col] = value
+                if values:
+                    rows[next_row] = values
                 element.clear()
-    width = max((max(v) for v in rows.values() if v), default=0)
+    width = max((max(v) for v in rows.values()), default=0)
     last = max(rows, default=0)
     return names, [[rows.get(r, {}).get(c) for c in range(1, width + 1)]
                    for r in range(1, last + 1)], hidden
 
 
-def _cell_value(cell, shared):
+def _cell_value(cell, shared, formats, date1904):
     kind = cell.get("t", "n")
     value = None
     inline = None
@@ -484,45 +605,182 @@ def _cell_value(cell, shared):
     if kind == "b":
         return value == "1"
     try:
-        return float(value)
+        number = float(value)
     except ValueError:
         return value
+    try:
+        shows, code = formats[int(cell.get("s") or 0)]
+    except (ValueError, IndexError):
+        return number
+    if shows == "percent":
+        return Percent(number, code)
+    return _moment(number, shows, date1904) if shows else number
 
 
-class _Semicolon(csv.excel):
-    delimiter = ";"
+# the codes of the built-in number formats that show a percentage, a date or a time
+_BUILTIN_CODES = {9: "0%", 10: "0.00%", 14: "mm-dd-yy", 15: "d-mmm-yy", 16: "d-mmm",
+                  17: "mmm-yy", 18: "h:mm AM/PM", 19: "h:mm:ss AM/PM", 20: "h:mm",
+                  21: "h:mm:ss", 22: "m/d/yy h:mm", 45: "mm:ss", 46: "[h]:mm:ss",
+                  47: "mmss.0"}
+# what a format code holds besides its own letters: text in quotes, a character after a
+# backslash, an underscore or an asterisk, and a colour, condition or locale in brackets;
+# [h], [m] and [s] are hours, minutes and seconds counted past a day
+_FORMAT_LITERALS = re.compile(r'"[^"]*"|\\.|_.|\*.|\[(?![hms]+\])[^\]]*\]', re.IGNORECASE)
+_EPOCH_1900 = datetime(1899, 12, 30)
+_EPOCH_1904 = datetime(1904, 1, 1)
+
+
+def _format_kind(code):
+    """What a number format code shows of a number: "date", "datetime", "time", "percent",
+    or None for the number itself. Only the section for positive numbers is read."""
+    bare = _FORMAT_LITERALS.sub("", code).split(";")[0].lower()
+    if bare == "general":
+        return None
+    has_time = "h" in bare or "s" in bare
+    # m is the minutes next to hours or seconds, the month otherwise
+    has_date = "d" in bare or "y" in bare or ("m" in bare and not has_time)
+    if has_date:
+        return "datetime" if has_time else "date"
+    if has_time:
+        return "time"
+    return "percent" if "%" in bare else None
+
+
+def _cell_formats(zf, path) -> list:
+    """(what the format shows, as _format_kind() names it, format code) of each cell style
+    of the workbook, by its index; empty for a workbook without a styles part."""
+    try:
+        styles = ET.fromstring(zf.read(path))  # nosec B314
+    except KeyError:
+        return []
+    codes = dict(_BUILTIN_CODES)
+    numbers = []
+    for section in styles:
+        name = _local(section.tag)
+        if name == "numFmts":
+            for item in section:
+                codes[_whole(item.get("numFmtId"))] = item.get("formatCode") or ""
+        elif name == "cellXfs":
+            numbers = [_whole(xf.get("numFmtId")) for xf in section
+                       if _local(xf.tag) == "xf"]
+    return [(_format_kind(codes.get(number, "")), codes.get(number, "")) for number in numbers]
+
+
+def _whole(text) -> int:
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _moment(number, shows, date1904):
+    """The date, date with time or time a cell shows for its number; the number itself when
+    it stands for none, as a negative one or, counted from 1900, one below 1."""
+    try:
+        if shows == "time":
+            if not 0 <= number < 1:
+                return number
+            return (datetime.min + timedelta(seconds=round(number * 86400))).time()
+        days = int(number)
+        if date1904:
+            epoch = _EPOCH_1904
+            if number < 0:
+                return number
+        else:
+            epoch = _EPOCH_1900
+            if number < 1:
+                return number
+            if number < 60:
+                # Excel counts a 29 February 1900, which did not exist
+                days += 1
+        if shows == "date":
+            return (epoch + timedelta(days=days)).date()
+        return epoch + timedelta(days=days, seconds=round((number - int(number)) * 86400))
+    except (OverflowError, ValueError):
+        return number
+
+
+# the column separators a CSV is tried with, the earlier one chosen when two fit as well
+_SEPARATORS = (";", "\t", ",")
+# how much of a CSV is read to find its separator, in characters
+_SAMPLE = 65536
 
 
 def _read_csv(path):
     with open(path, "rb") as fp:
         raw = fp.read()
-    # Excel writes "CSV UTF-8" with a BOM and plain "CSV" in the Windows code page; latin-1
-    # decodes any byte, so the loop always ends with text
-    text = ""
+    text = _decoded(raw)
+    separator = _separator(text[:_SAMPLE], complete=len(text) <= _SAMPLE)
+    # newline="": the csv module finds the line ends itself, a carriage return alone
+    # included, and keeps the ones inside a quoted cell
+    lines = csv.reader(io.StringIO(text, newline=""), delimiter=separator)
+    return [[cell if cell != "" else None for cell in row] for row in lines]
+
+
+def _decoded(raw: bytes) -> str:
+    # Excel writes "Unicode Text" in UTF-16 with a byte order mark, "CSV UTF-8" with a BOM
+    # and plain "CSV" in the Windows code page; latin-1 decodes any byte, so the loop always
+    # ends with text
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
     for encoding in ("utf-8-sig", "cp1250", "latin-1"):
         try:
-            text = raw.decode(encoding)
-            break
+            return raw.decode(encoding)
         except UnicodeDecodeError:
             continue
-    sample = text[:4096]
-    if _semicolon_columns(sample, complete=len(text) <= len(sample)):
-        dialect = _Semicolon
-    else:
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=";,\t")
-        except csv.Error:
-            dialect = _Semicolon if sample.count(";") >= sample.count(",") else csv.excel
-    return [[cell if cell != "" else None for cell in row]
-            for row in csv.reader(io.StringIO(text), dialect)]
+    return ""
 
 
-def _semicolon_columns(sample, complete) -> bool:
-    """Whether every line of sample holds the same number of ";", at least one: the layout a
-    Romanian Excel exports, where "," is the decimal separator. csv.Sniffer returns ","
-    when both occur once per line. An incomplete sample leaves out its cut last line."""
-    lines = [line for line in sample.splitlines() if line.strip()]
-    if not complete:
-        lines = lines[:-1]
-    counts = {line.count(";") for line in lines}
-    return len(counts) == 1 and counts.pop() > 0
+def _separator(sample, complete) -> str:
+    """The column separator of a CSV text: of ';', tab and ',', the one that the largest share
+    of its lines hold the same number of times, outside quoted cells. A comma between two
+    digits can be a decimal comma: such commas do not count when ';' or tab fit at least half
+    of the lines, and a text whose every comma is one has no ',' columns. An incomplete
+    sample leaves out its cut last line."""
+    lines = []
+    # of ';', of tab, of ',', and of ',' not between two digits
+    counts = [0, 0, 0, 0]
+    quoted = filled = False
+    for position, char in enumerate(sample):
+        if char == '"':
+            quoted = not quoted
+            filled = True
+        elif quoted:
+            continue
+        elif char in "\r\n":
+            if filled:
+                lines.append(counts)
+            counts, filled = [0, 0, 0, 0], False
+        else:
+            filled = True
+            if char == ";":
+                counts[0] += 1
+            elif char == "\t":
+                counts[1] += 1
+            elif char == ",":
+                counts[2] += 1
+                if not (sample[position - 1:position].isdigit()
+                        and sample[position + 1:position + 2].isdigit()):
+                    counts[3] += 1
+    if filled and complete:
+        lines.append(counts)
+    fits = [_share([line[i] for line in lines]) for i in range(4)]
+    candidates = [(fits[0], 0), (fits[1], -1)]
+    if fits[3][0]:
+        others_fit = max(fits[0][0], fits[1][0]) >= 0.5
+        candidates.append((fits[3] if others_fit else fits[2], -2))
+    share, order = max((fit[0], order) for fit, order in candidates)
+    return _SEPARATORS[-order] if share else _SEPARATORS[0]
+
+
+def _share(counts):
+    """(the share of counts equal to their most frequent value above 0, that value); (0, 0)
+    when none is above 0."""
+    positive = [count for count in counts if count > 0]
+    if not positive:
+        return 0.0, 0
+    value = Counter(positive).most_common(1)[0][0]
+    return positive.count(value) / len(counts), value

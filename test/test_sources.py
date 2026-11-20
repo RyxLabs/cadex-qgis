@@ -81,10 +81,23 @@ class Stereo70Tests(unittest.TestCase):
         self.assertIn("citit ca Stereo 70", stereo70.notes([snapshot])[0])
 
 
-class SourceTests(unittest.TestCase):
+class SourceFolderTest(unittest.TestCase):
+    """A temporary folder for the sources of each test."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="cadex_src_")
+        self.addCleanup(helpers.remove_folder, self.tmp)
+
+    def problems(self, paths, recursive=True):
+        """{file name: the reason it cannot be read, or None} of the sources found in paths."""
+        sources = cgxml_sources.list_sources(paths, recursive)
+        return {cgxml_sources.file_name(s): p for s, _r, p in cgxml_sources.read_each(sources)}
+
+
+class SourceTests(SourceFolderTest):
+
+    def setUp(self):
+        super().setUp()
         self.a = os.path.join(self.tmp, "sector1")
         self.b = os.path.join(self.tmp, "sector2")
         for folder in (self.a, self.b):
@@ -94,9 +107,6 @@ class SourceTests(unittest.TestCase):
                         synthetic.Land(rings=[synthetic.square(0, 0, 10)], cadgenno="10189"))
         with open(os.path.join(self.a, "10188.dbf"), "w") as fp:
             fp.write("not a cgxml")
-
-    def tearDown(self):
-        helpers.remove_folder(self.tmp)
 
     def test_split_and_join(self):
         self.assertEqual(cgxml_sources.split_paths(r"C:\date\livrare 1"), [r"C:\date\livrare 1"])
@@ -141,6 +151,15 @@ class SourceTests(unittest.TestCase):
             fp.write(b"\x00\x05\x16\x07")
         names = [cgxml_sources.file_name(s) for s in cgxml_sources.list_sources([archive, self.b])]
         self.assertEqual(names, ["10188.cgxml", "10188.cgxml"])
+
+    def test_files_are_listed_by_the_numbers_in_their_names(self):
+        folder = os.path.join(self.tmp, "nume")
+        # a superscript is a digit that is not a number
+        for name in ("10.cgxml", "2.cgxml", "1²2.cgxml"):
+            synthetic.write(folder, name, synthetic.Land(
+                rings=[synthetic.square(500000, 400000, 10)], cadgenno="1"))
+        self.assertEqual([s[0] for s in cgxml_sources.list_sources(folder)],
+                         ["1²2.cgxml", "2.cgxml", "10.cgxml"])
 
     def test_stop_ends_the_reading(self):
         sources = cgxml_sources.list_sources([self.a, self.b])
@@ -352,22 +371,15 @@ class ColumnSpellingSourceTests(unittest.TestCase):
         self.assertEqual(found[3], 20)
 
 
-class ConversionSourceTests(unittest.TestCase):
+class ConversionSourceTests(SourceFolderTest):
     """A damaged, locked or unreadable archive or folder is one unreadable source, reported in
     Romanian, and the other sources are still read."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="cadex_src_")
+        super().setUp()
         self.good = os.path.join(self.tmp, "livrare")
         synthetic.write(self.good, "10188.cgxml", synthetic.Land(
             rings=[synthetic.square(0, 0, 10)], cadgenno="10188"))
-
-    def tearDown(self):
-        helpers.remove_folder(self.tmp)
-
-    def problems(self, paths, recursive=True):
-        sources = cgxml_sources.list_sources(paths, recursive)
-        return {cgxml_sources.file_name(s): p for s, _r, p in cgxml_sources.read_each(sources)}
 
     def archive(self, name="arhiva.zip"):
         path = os.path.join(self.tmp, name)
@@ -445,6 +457,148 @@ class ConversionSourceTests(unittest.TestCase):
             return scandir(path)
         with mock.patch.object(os, "scandir", listing):
             self.assertEqual(self.problems(self.good), {"10188.cgxml": None})
+
+
+class ChosenPathTests(SourceFolderTest):
+    """A chosen path that does not exist or is not a CGXML source is reported, and the other
+    sources are still read."""
+
+    def setUp(self):
+        super().setUp()
+        self.good = os.path.join(self.tmp, "livrare")
+        synthetic.write(self.good, "10188.cgxml", synthetic.Land(
+            rings=[synthetic.square(500000, 400000, 10)], cadgenno="10188"))
+
+    def test_a_path_that_does_not_exist_is_reported_and_the_rest_is_read(self):
+        missing = [os.path.join(self.tmp, name)
+                   for name in ("sector2", "livrare_v2.zip", "10200.cgxml")]
+        self.assertEqual(self.problems([self.good] + missing), {
+            "10188.cgxml": None,
+            "sector2": "calea nu a fost găsită",
+            "livrare_v2.zip": "arhiva ZIP nu a fost găsită",
+            "10200.cgxml": "fișierul nu a fost găsit"})
+
+    def test_a_file_of_another_kind_is_reported_and_the_rest_is_read(self):
+        other = os.path.join(self.tmp, "livrare.rar")
+        with open(other, "wb") as fp:
+            fp.write(b"Rar!")
+        self.assertEqual(self.problems([self.good, other]), {
+            "10188.cgxml": None,
+            "livrare.rar": "nu este un folder, o arhivă ZIP sau un fișier .cgxml"})
+
+    def test_a_path_named_twice_is_reported_once(self):
+        missing = os.path.join(self.tmp, "sector2")
+        self.assertEqual(len(cgxml_sources.list_sources([missing, missing, self.good])), 2)
+
+    def test_the_listing_of_a_folder_stops_when_asked(self):
+        for n in range(3):
+            synthetic.write(os.path.join(self.good, f"sector{n}"), "1.cgxml", synthetic.Land(
+                rings=[synthetic.square(500000, 400000, 10)], cadgenno="1"))
+        walked = []
+
+        def stop():
+            walked.append(1)
+            return len(walked) > 2
+        found = cgxml_sources.list_sources(self.good, stop=stop)
+        self.assertLess(len(found), 4)
+        self.assertEqual(len(cgxml_sources.list_sources(self.good)), 4)
+
+
+class ArchiveMemberTests(SourceFolderTest):
+
+    def test_a_member_larger_than_its_header_declares_is_refused_without_being_inflated(self):
+        import struct
+        import tracemalloc
+        megabytes = 48
+        archive = os.path.join(self.tmp, "livrare.zip")
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("10188.cgxml", b" " * (megabytes * 1024 * 1024))
+        with open(archive, "rb") as fp:
+            data = bytearray(fp.read())
+        # 1000 bytes as the uncompressed size, in the member's own header and in the directory
+        for signature, offset in ((b"PK\x03\x04", 22), (b"PK\x01\x02", 24)):
+            start = data.find(signature) + offset
+            data[start:start + 4] = struct.pack("<L", 1000)
+        with open(archive, "wb") as fp:
+            fp.write(data)
+        del data
+        sources = cgxml_sources.list_sources(archive)
+        tracemalloc.start()
+        try:
+            [(_source, parsed, problem)] = list(cgxml_sources.read_each(sources))
+            _now, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((parsed, problem), (None, "fișierul din arhivă este deteriorat"))
+        self.assertLess(peak, megabytes * 1024 * 1024 / 4)
+
+
+class ReadAheadTests(SourceFolderTest):
+    """The files of a folder are opened several at a time, and their records still come in
+    the order of the listing."""
+
+    def setUp(self):
+        super().setUp()
+        self.ids = list(range(1, 41))
+        for n in self.ids:
+            synthetic.write(self.tmp, f"{n}.cgxml", synthetic.Land(
+                rings=[synthetic.square(500000 + 20 * n, 400000, 10)], cadgenno=str(n)))
+        with open(os.path.join(self.tmp, "7.cgxml"), "wb") as fp:
+            fp.write(b"<CGXML><Land>")
+        self.sources = cgxml_sources.list_sources(self.tmp)
+
+    def slow_open(self):
+        """Patch open() to take 20 ms for a .cgxml file. Returns the dict whose "most" is the
+        largest number of such files being opened at one moment."""
+        import builtins
+        import threading
+        import time
+        from unittest import mock
+        opened = builtins.open
+        state = {"now": 0, "most": 0}
+        lock = threading.Lock()
+
+        def slow(path, *args, **kwargs):
+            if not str(path).endswith(".cgxml"):
+                return opened(path, *args, **kwargs)
+            with lock:
+                state["now"] += 1
+                state["most"] = max(state["most"], state["now"])
+            try:
+                time.sleep(0.02)
+                return opened(path, *args, **kwargs)
+            finally:
+                with lock:
+                    state["now"] -= 1
+        patcher = mock.patch.object(builtins, "open", slow)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return state
+
+    def test_files_are_opened_several_at_a_time_and_read_in_order(self):
+        state = self.slow_open()
+        results = list(cgxml_sources.read_each(self.sources))
+        self.assertGreater(state["most"], 1)
+        self.assertEqual([source for source, _parsed, _problem in results], self.sources)
+        self.assertEqual([parsed[0][0]["id"] if parsed else problem
+                          for _source, parsed, problem in results],
+                         [n if n != 7 else "fișierul nu are conținut sau este incomplet (rândul 1)"
+                          for n in self.ids])
+
+    def test_a_stop_ends_the_reading_and_leaves_no_file_being_read(self):
+        import threading
+        state = self.slow_open()
+        before = threading.active_count()
+        read = []
+        for result in cgxml_sources.read_each(self.sources, stop=lambda: len(read) >= 5):
+            read.append(result)
+        self.assertEqual(len(read), 5)
+        self.assertEqual((state["now"], threading.active_count()), (0, before))
+
+    def test_progress_follows_the_files_handed_over(self):
+        shares = []
+        list(cgxml_sources.read_each(self.sources, progress=shares.append))
+        self.assertEqual(shares, [n / 40 for n in self.ids])
 
 
 def tearDownModule():

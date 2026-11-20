@@ -7,7 +7,9 @@ import html
 from typing import Optional
 
 from qgis.PyQt.QtCore import QSize, Qt, QUrl  # type: ignore
-from qgis.PyQt.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPixmap  # type: ignore
+from qgis.PyQt.QtGui import (  # type: ignore
+    QColor, QDesktopServices, QGuiApplication, QIcon, QPainter, QPixmap,
+)
 from qgis.PyQt.QtWidgets import (  # type: ignore
     QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLineEdit, QMessageBox,
     QRadioButton, QSpinBox, QTabWidget, QToolButton, QTreeWidget, QWidget,
@@ -20,9 +22,16 @@ from ..services import fmt, roles
 
 PLUGIN_NAME = "CADex"
 
-# set on a combo box whose entry the user picked or that was restored from the remembered
-# values; widgets.fill_field_combo keeps that entry when it fills the box again
+# set on a combo box whose entry the user picked, in this window or at an earlier run;
+# widgets.fill_field_combo keeps that entry when it fills the box again
 CHOSEN_PROPERTY = "cadexChosen"
+# set on a field combo box: the column remembered as the user's choice while the box does not
+# list it; widgets.fill_field_combo selects it once it is listed
+WANTED_PROPERTY = "cadexWanted"
+
+# the layers add_layers() was given while it adds none to the project, a list per call; None
+# while results go to the project
+_withheld = None
 
 
 def log_message(message: str, level=Qgis.MessageLevel.Info):
@@ -40,8 +49,31 @@ def theme_icon(name: str) -> QIcon:
     return QgsApplication.getThemeIcon(name)
 
 
-def swatch_icon(color: str, size: int = 12) -> QIcon:
-    pixmap = QPixmap(size, size)
+def screen_ratio() -> float:
+    app = QGuiApplication.instance()
+    return float(app.devicePixelRatio()) if app is not None else 1.0
+
+
+def icon_pixmap(icon: QIcon, size: int) -> QPixmap:
+    """icon for a label size logical pixels wide, drawn at the screen's pixel ratio. On Qt5
+    QIcon.pixmap(size) draws at 1x, which a label on a scaled screen stretches."""
+    ratio = screen_ratio()
+    pixmap = icon.pixmap(QSize(size, size))
+    if ratio > 1 and pixmap.devicePixelRatio() < ratio:
+        side = round(size * ratio)
+        pixmap = icon.pixmap(QSize(side, side))
+        pixmap.setDevicePixelRatio(ratio)
+    return pixmap
+
+
+def swatch_pixmap(color: str, size: int = 12, ratio: Optional[float] = None) -> QPixmap:
+    """A square of color for a label, size logical pixels wide, painted at the screen's pixel
+    ratio or at the one given."""
+    ratio = screen_ratio() if ratio is None else ratio
+    side = round(size * ratio)
+    pixmap = QPixmap(side, side)
+    # set before painting: the painter then draws in logical pixels
+    pixmap.setDevicePixelRatio(ratio)
     pixmap.fill(QColor(0, 0, 0, 0))
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -50,7 +82,12 @@ def swatch_icon(color: str, size: int = 12) -> QIcon:
     painter.setBrush(QColor(color))
     painter.drawRoundedRect(0, 0, size - 1, size - 1, 2, 2)
     painter.end()
-    return QIcon(pixmap)
+    return pixmap
+
+
+def swatch_icon(color: str, size: int = 12) -> QIcon:
+    # painted at 1x: a check box shows an icon made from a larger painting wider than size
+    return QIcon(swatch_pixmap(color, size, 1.0))
 
 
 # --- messages ---
@@ -153,11 +190,25 @@ def show_result(parent: QWidget, title: str, headline: str, **kwargs):
         dialog.deleteLater()
 
 
-def add_layers(layers, group_title=None, report=True):
-    """Add a run's result layers to the project, two or more in a new group at the top.
-    report=False for layers that are input data for the other tools, such as converted CGXML."""
+def withhold(calls):
+    """Make add_layers() add nothing to the project and append the layers of each call to
+    calls, a list; None lets results into the project again. Returns the setting it replaces,
+    for the caller to put back."""
+    global _withheld
+    previous, _withheld = _withheld, calls
+    return previous
+
+
+def add_layers(layers, group_title=None, report=True) -> list:
+    """Add a run's result layers to the project, two or more in a new group at the top, and
+    return the layers added. report=False for layers that are input data for the other tools,
+    such as converted CGXML. Under withhold(), for a run whose project was closed meanwhile,
+    the layers are recorded there and none is added."""
     project = QgsProject.instance()
     layers = [layer for layer in layers if layer is not None]
+    if _withheld is not None:
+        _withheld.append(layers)
+        return []
     if report:
         for layer in layers:
             roles.mark_report(layer)
@@ -248,7 +299,7 @@ def _as_bool(value) -> bool:
     return bool(value)
 
 
-def read_widget_state(widget, by_text: bool = False):
+def read_widget_state(widget):
     """A storable value for the widget, None for a widget type not handled here.
 
     Custom widgets provide remembered_value() and restore_value().
@@ -262,8 +313,6 @@ def read_widget_state(widget, by_text: bool = False):
     if isinstance(widget, QDoubleSpinBox):
         return float(widget.value())
     if isinstance(widget, QComboBox):
-        if by_text:
-            return widget.currentText()
         data = widget.currentData()
         return data if isinstance(data, str) else int(widget.currentIndex())
     if isinstance(widget, QLineEdit):
@@ -273,7 +322,7 @@ def read_widget_state(widget, by_text: bool = False):
     return None
 
 
-def apply_widget_state(widget, value, by_text: bool = False):
+def apply_widget_state(widget, value):
     """Restore a stored value. A value the widget cannot take is ignored."""
     if hasattr(widget, "restore_value"):
         widget.restore_value(value)
@@ -284,15 +333,12 @@ def apply_widget_state(widget, value, by_text: bool = False):
     elif isinstance(widget, QDoubleSpinBox):
         widget.setValue(float(value))
     elif isinstance(widget, QComboBox):
-        if by_text:
-            index = widget.findText(str(value))
-        else:
-            index = widget.findData(value) if isinstance(value, str) else -1
-            if index < 0:
-                try:
-                    index = int(float(value))
-                except (TypeError, ValueError):
-                    index = -1
+        index = widget.findData(value) if isinstance(value, str) else -1
+        if index < 0:
+            try:
+                index = int(float(value))
+            except (TypeError, ValueError):
+                index = -1
         if 0 <= index < widget.count():
             widget.setCurrentIndex(index)
             widget.setProperty(CHOSEN_PROPERTY, True)
@@ -302,3 +348,22 @@ def apply_widget_state(widget, value, by_text: bool = False):
         index = int(float(value))
         if 0 <= index < widget.count():
             widget.setCurrentIndex(index)
+
+
+def field_choice(combo):
+    """(item data, whether the user chose it) of a combo box filled with field names; the
+    data is "" for the entry that stands for no field."""
+    return combo.currentData() or "", bool(combo.property(CHOSEN_PROPERTY))
+
+
+def choose_field(combo, data) -> bool:
+    """Select the entry with this item data as the user's choice. While the box does not
+    list it, it is kept for widgets.fill_field_combo to select; False then."""
+    index = combo.findData(data)
+    if index < 0:
+        combo.setProperty(WANTED_PROPERTY, data)
+        return False
+    combo.setProperty(WANTED_PROPERTY, None)
+    combo.setCurrentIndex(index)
+    combo.setProperty(CHOSEN_PROPERTY, True)
+    return True

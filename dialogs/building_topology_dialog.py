@@ -13,10 +13,11 @@ from . import _ui_helpers
 from .base_dialog import BaseDialog
 from .widgets import (
     CheckList, LayerChecklist, converted_column, data_field_names,
-    fill_field_combo, hint_label, make_form,
+    fill_field_combo, hint_label, make_form, user_chose,
 )
 from ..services import building_topology_service as bts
 from ..services import fmt, layer_style, stereo70
+from ..services import topology_check_service as tcs
 from ..services.layer_sources import LayerSnapshot, merged_fields
 
 
@@ -68,6 +69,18 @@ class BuildingTopologyDialog(BaseDialog):
 
         params = QGroupBox(self.tr("Tăiere"))
         form = make_form(params)
+        self.tolerance = QDoubleSpinBox()
+        self.tolerance.setRange(0.0, 1.0)
+        self.tolerance.setDecimals(3)
+        self.tolerance.setSingleStep(0.005)
+        self.tolerance.setValue(tcs.BUILDING_TOLERANCE)
+        self.tolerance.setSuffix(" m")
+        self.tolerance.setToolTip(self.tr(
+            "Construcția se taie când un punct al ei iese din imobil cu mai mult de această "
+            "valoare sau când o parte a ei mai lată decât această valoare stă în afara "
+            "imobilului. Cu aceeași valoare ca în Verificare Topologică, se taie exact "
+            "construcțiile raportate acolo ca ieșite din imobil."))
+        form.addRow(self.tr("Ieșire construcții:"), self.tolerance)
         self.buffer = QDoubleSpinBox()
         self.buffer.setRange(0.0, 1.0)
         self.buffer.setDecimals(4)
@@ -118,16 +131,15 @@ class BuildingTopologyDialog(BaseDialog):
 
         self.run_btn = self.add_run_buttons(self.tr("Corectează"), self._run)
 
+        self.remember("tolerance", self.tolerance)
         self.remember("buffer", self.buffer)
         self.remember("threshold", self.threshold)
         self.remember("join", self.join_group)
         self._refresh_join()
         self._refresh_link()
-        self.remember("link_field", self.link_combo, by_text=True)
-        self.remember("key_field", self.key_combo, by_text=True)
+        self.remember("link_field", self.link_combo, column=True)
+        self.remember("key_field", self.key_combo, column=True)
         self.restore_remembered()
-        # a remembered "(după suprapunere)" may be the untouched default of an earlier run
-        self._refresh_link()
         self.link_combo.activated.connect(self._on_link_chosen)
         self.join_group.setCollapsed(not self.join_group.isChecked())
         self._on_link_changed()
@@ -138,7 +150,8 @@ class BuildingTopologyDialog(BaseDialog):
         # holds the imobil
         layers = self.constructii.checked_layers()
         keep = self.link_combo.currentData()
-        if not keep and not self._link_chosen:
+        # "(după suprapunere)" picked by hand, in this window or at an earlier run, stays
+        if not keep and not self._link_chosen and not user_chose(self.link_combo):
             keep = converted_column(layers, "id")
         fill_field_combo(self.link_combo, data_field_names(layers), None,
                          self.tr("(după suprapunere)"), keep)
@@ -198,6 +211,7 @@ class BuildingTopologyDialog(BaseDialog):
             imobile=imobile_snaps,
             constructii=[LayerSnapshot(lyr) for lyr in constructii],
             buffer_m=self.buffer.value(), threshold=self.threshold.value(),
+            tolerance=self.tolerance.value(),
             join_fields=join_fields, link_field=link_field, key_field=key_field,
             finished_cb=self._on_finished),
             self.tr("Se corectează construcțiile..."))
@@ -241,12 +255,13 @@ class BuildingTopologyDialog(BaseDialog):
         notes += self.report_notes(task)
         notes += unwritten
         notes += stereo70.notes(task.snapshots())
-        notes.append(fmt.plural(
-            len(layers),
-            self.tr("Layer creat: {0}. Este temporar; salvați-l dacă doriți să-l păstrați."),
-            self.tr("Layere create: {0}. Sunt temporare; salvați-le dacă doriți să le "
-                    "păstrați."),
-        ).format(", ".join(layer.name() for layer in layers)))
+        if layers:
+            notes.append(fmt.plural(
+                len(layers),
+                self.tr("Layer creat: {0}. Este temporar; salvați-l dacă doriți să-l păstrați."),
+                self.tr("Layere create: {0}. Sunt temporare; salvați-le dacă doriți să le "
+                        "păstrați."),
+            ).format(", ".join(layer.name() for layer in layers)))
         self.show_result(headline, counts=counts, notes=notes, layers=layers,
                          warning=bool(states[bts.LOSS] or states[bts.FAILED]
                                       or states[bts.NO_PARCEL] or states[bts.ELSEWHERE]
@@ -271,3 +286,7 @@ class BuildingTopologyDialog(BaseDialog):
         layer_style.style_categories(
             layer, names["stare"], [(s, s, bts.STATE_COLORS[s]) for s in bts.STATES])
         return layer
+
+    def project_changed(self):
+        super().project_changed()
+        self._link_chosen = False

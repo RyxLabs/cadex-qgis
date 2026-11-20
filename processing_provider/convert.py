@@ -5,23 +5,30 @@
 CGXML window."""
 
 import json
+import os
 import re
 
 from qgis.core import (  # type: ignore
-    Qgis, QgsFeature, QgsProcessingException, QgsProcessingOutputLayerDefinition,
-    QgsProcessingOutputNumber, QgsProcessingParameterBoolean, QgsProcessingParameterFeatureSink,
-    QgsProcessingParameterFileDestination, QgsProcessingParameterMultipleLayers, QgsProperty,
+    Qgis, QgsFeature, QgsProcessing, QgsProcessingException,
+    QgsProcessingOutputLayerDefinition, QgsProcessingOutputNumber,
+    QgsProcessingParameterBoolean, QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterFileDestination, QgsProcessingParameterMultipleLayers,
+    QgsProperty, QgsVectorFileWriter,
 )
 
 from .base import SOURCE_FILE, SOURCE_POLYGON, CadexAlgorithm
 from ..i18n import tr as _tr
 from ..services import (
-    cgxml_columns, cgxml_export, deps, dialog_memory, layer_style, outputs, roles,
-    settings_service, siruta,
+    cgxml_columns, cgxml_export, dialog_memory, layer_style, outputs, roles, settings_service,
+    siruta, xlsx_report,
 )
 from ..services.tasks import log
 
-_FILE_FORMAT = re.compile(r"\.(shp|gpkg)(?=$|[|'\"\s])", re.IGNORECASE)
+# the file of an "ogr:dbname='...' table=..." destination, and the start of a destination in
+# a database, such as "postgis:..."; a drive letter is a single letter
+_OGR_FILE = re.compile(r"^ogr:.*?dbname='([^']*)'")
+_PROVIDER = re.compile(r"^[A-Za-z]{2,}:")
+_FORMATS = {"ESRI Shapefile": "shp", "GPKG": "gpkg"}
 
 
 def saved_layouts():
@@ -66,10 +73,21 @@ def destination_text(value, context) -> str:
 
 
 def destination_format(destination) -> str:
-    """"shp" or "gpkg" for a destination written to such a file, "" for any other, such as a
-    temporary layer."""
-    match = _FILE_FORMAT.search(str(destination or ""))
-    return match.group(1).lower() if match else ""
+    """"shp" or "gpkg" for a destination QGIS writes as a Shapefile or as a GeoPackage, "" for
+    any other, such as a temporary layer. QGIS takes the driver from the file's extension, so
+    .shz and .dbf give a Shapefile too, and writes a file of an unknown extension, or of
+    none, as a GeoPackage, whatever the default vector format of Processing."""
+    text = str(destination or "").strip()
+    if not text or text == QgsProcessing.TEMPORARY_OUTPUT or text.startswith("memory:"):
+        return ""
+    database = _OGR_FILE.match(text)
+    if database:
+        text = database.group(1)
+    elif _PROVIDER.match(text):
+        return ""
+    extension = os.path.splitext(text.split("|")[0])[1]
+    driver = QgsVectorFileWriter.driverForExtension(extension) or "GPKG"
+    return _FORMATS.get(driver, "")
 
 
 class ConvertCgxmlAlgorithm(CadexAlgorithm):
@@ -129,11 +147,6 @@ class ConvertCgxmlAlgorithm(CadexAlgorithm):
         paths = self.parameterAsFileList(parameters, "INPUT", context)
         recursive = self.parameterAsBoolean(parameters, "RECURSIVE", context)
         dxf_path = self.parameterAsFileOutput(parameters, "OUTPUT_DXF", context)
-        if dxf_path and not deps.is_installed("ezdxf"):
-            raise QgsProcessingException(self.tr(
-                "Formatul DXF are nevoie de pachetul Python 'ezdxf'. Instalați-l o dată din "
-                "fereastra Conversie CGXML, alegând formatul DXF, sau din OSGeo4W Shell cu "
-                "comanda: python -m pip install ezdxf"))
         layouts = saved_layouts()
         formats = self._layer_formats(parameters, context, layouts)
         read = cgxml_export.read_all(paths, recursive, feedback.isCanceled,
@@ -161,8 +174,15 @@ class ConvertCgxmlAlgorithm(CadexAlgorithm):
         step = cgxml_export.percent_steps(feedback.setProgress, 70, 85, mapped)
         for which, records, key in (("imobile", read.imobile, "OUTPUT_IMOBILE"),
                                     ("constructii", read.constructii, "OUTPUT_CONSTRUCTII")):
+            drawn = [r for r in records if r.get("rings")]
+            if which == "constructii" and which in formats and not drawn:
+                # as in the window: no layer without a construcție to draw
+                feedback.pushWarning(self.tr("Sursa nu are construcții cu coordonate, deci nu "
+                                             "s-a scris un layer de construcții."))
+                continue
             shapefile = formats.get(which) == "shp"
-            fields, names = cgxml_export.output_fields(which, layouts[which], shapefile)
+            fields, names = cgxml_export.output_fields(which, layouts[which], shapefile,
+                                                       drawn)
             sink, destination = self.sink(parameters, key, context, fields,
                                           Qgis.WkbType.MultiPolygon)
             if sink is None:
@@ -172,6 +192,12 @@ class ConvertCgxmlAlgorithm(CadexAlgorithm):
                                             truncated, feedback, step), feedback)
             if feedback.isCanceled():
                 raise self._canceled()
+            temporary = context.temporaryLayerStore().mapLayer(destination)
+            if temporary is not None:
+                # a model or a script hands this layer to its next algorithm as it is, without
+                # the loading that styles it
+                roles.mark_batch(temporary, batch)
+                roles.mark_columns(temporary, names)
             for note in cgxml_export.unmapped_notes(which, records):
                 feedback.pushWarning(note)
             if truncated:
@@ -188,11 +214,13 @@ class ConvertCgxmlAlgorithm(CadexAlgorithm):
 
         xlsx_path = self.parameterAsFileOutput(parameters, "OUTPUT_XLSX", context)
         if xlsx_path:
-            self._file_output(lambda: cgxml_export.write_xlsx(
+            cut = self._file_output(lambda: cgxml_export.write_xlsx(
                 xlsx_path, layouts, saved_names(), read.imobile, read.constructii,
                 cgxml_export.conversion_facts(paths, read.file_count, len(read.errors)),
                 [[f, m] for f, m in read.errors + read.warnings]),
                 xlsx_path, "OUTPUT_XLSX", results, feedback)
+            if cut:
+                feedback.pushWarning(xlsx_report.cut_note(cut))
         if dxf_path:
             dxf_step = cgxml_export.percent_steps(
                 feedback.setProgress, 85, 99, len(read.imobile) + len(read.constructii))
@@ -230,12 +258,14 @@ class ConvertCgxmlAlgorithm(CadexAlgorithm):
             yield feature
 
     def _file_output(self, write, path, key, results, feedback):
-        """Write an optional file output. One that cannot be written is reported as an error
-        that does not stop the run, and is left out of results."""
+        """Write an optional file output with write() and return what it returns. One that
+        cannot be written is reported as an error that does not stop the run, is left out of
+        results, and gives None."""
         try:
-            write()
+            written = write()
         except OSError as error:
             feedback.reportError(outputs.write_error(path, error), fatalError=False)
             log(f"{path}: {error}", Qgis.MessageLevel.Warning)
-            return
+            return None
         results[key] = path
+        return written

@@ -18,9 +18,5 @@ def plugin_version() -> str:
 
 
 def classFactory(iface):
-    # the optional packages (ezdxf) are installed in a pip --target folder that has to be on
-    # sys.path before any module imports them
-    from .services import deps
-    deps.bootstrap_sys_path()
     from .cadex import Cadex
     return Cadex(iface)

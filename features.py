@@ -78,9 +78,8 @@ CATALOG: tuple = (
         icon="constructii.svg",
         hint=QT_TRANSLATE_NOOP(
             "CADex",
-            "Taie construcțiile care depășesc limita imobilului pe care se "
-            "află, într-un layer nou, cu suprafața pierdută pentru fiecare "
-            "construcție"),
+            "Taie construcțiile ieșite din imobilul pe care se află, într-un "
+            "layer nou, cu suprafața pierdută pentru fiecare construcție"),
     ),
     Feature(
         method="open_settings",

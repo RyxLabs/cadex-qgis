@@ -7,12 +7,13 @@ import html
 
 from qgis.PyQt.QtCore import QSize, Qt  # type: ignore
 from qgis.PyQt.QtWidgets import (  # type: ignore
-    QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QScrollArea,
+    QFrame, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QScrollArea,
     QSplitter, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from . import _ui_helpers, theme
+from . import _ui_helpers
 from .base_dialog import SCREEN_SHARE, BaseDialog, screen_of
+from .widgets import LinkedText
 from .. import features, help_texts, plugin_version
 from ..features import QT_TRANSLATE_NOOP
 
@@ -54,14 +55,6 @@ WEB_TOOLS = (
 )
 
 ROLE = Qt.ItemDataRole.UserRole
-
-
-def _rich(text) -> QLabel:
-    label = QLabel(theme.colored_links(text))
-    label.setOpenExternalLinks(True)
-    label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-    label.setWordWrap(True)
-    return label
 
 
 def _scrolling(label) -> QScrollArea:
@@ -129,6 +122,13 @@ class HelpDialog(BaseDialog):
         layout.addWidget(splitter, 1)
         return tab
 
+    def _set_icons(self):
+        super()._set_icons()
+        for row in range(self.tools.count()):
+            item = self.tools.item(row)
+            feat = next(f for f in features.CATALOG if f.method == item.data(ROLE))
+            item.setIcon(_ui_helpers.plugin_icon(feat.icon))
+
     def page_html(self, method) -> str:
         feat = next(f for f in features.CATALOG if f.method == method)
         parts = [f"<h2>{html.escape(self.tr(feat.label).rstrip('.'))}</h2>",
@@ -178,7 +178,7 @@ class HelpDialog(BaseDialog):
             "arhivă ZIP, și folosiți interogările personalizate.")
             + f" <a href='{features.WEBSITE}/preturi'>"
             + self.tr("Prețuri") + "</a></p>")
-        layout.addWidget(_scrolling(_rich("".join(parts))), 1)
+        layout.addWidget(_scrolling(LinkedText("".join(parts))), 1)
         row = QHBoxLayout()
         row.addStretch()
         open_btn = QPushButton(self.tr("Deschide cadex.ro"))
@@ -191,7 +191,7 @@ class HelpDialog(BaseDialog):
     def _about_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.addWidget(_scrolling(_rich(
+        layout.addWidget(_scrolling(LinkedText(
             f"<h2>CADex {plugin_version()}</h2>"
             + "<p>" + self.tr("Instrumente pentru cadastrul sistematic și fișierele "
                               "CGXML, în QGIS.") + "</p>"

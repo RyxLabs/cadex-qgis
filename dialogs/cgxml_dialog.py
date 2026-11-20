@@ -13,7 +13,7 @@ from qgis.PyQt.QtWidgets import (  # type: ignore
     QAbstractItemView, QCheckBox, QComboBox, QGroupBox, QHeaderView, QLineEdit,
     QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
-from qgis.core import QgsVectorLayer  # type: ignore
+from qgis.core import QgsMapLayerStyle, QgsProject, QgsVectorLayer  # type: ignore
 
 from . import _ui_helpers
 from .base_dialog import BaseDialog
@@ -23,8 +23,8 @@ from .widgets import (
 from .. import features
 from ..i18n import tr as _tr
 from ..services import (
-    cgxml_columns, cgxml_export, deps, dialog_memory, fmt, layer_style, roles, settings_service,
-    siruta,
+    cgxml_columns, cgxml_export, dialog_memory, fmt, layer_style, roles, settings_service,
+    siruta, tasks, xlsx_report,
 )
 
 # sample values for the DXF label preview
@@ -225,6 +225,8 @@ class CgxmlDialog(BaseDialog):
         super().__init__(iface, parent)
         self.setMinimumWidth(640)
         self._auto_base = ""
+        # the layers removed from the project for the run in progress (_described)
+        self._removed = []
         self._setup_ui()
 
     # --- ui ---
@@ -245,8 +247,8 @@ class CgxmlDialog(BaseDialog):
         self.remember("recursive", self.source.recursive)
         self.remember("format", self.format_combo)
         self.remember("add_to_project", self.add_to_project)
-        self.remember("input", self.source.edit)
-        self.remember("output", self.output_row.edit)
+        self.remember("input", self.source.edit, per_project=True)
+        self.remember("output", self.output_row.edit, per_project=True)
         self.restore_remembered()
         self._on_format_changed()
         self.source.refresh()
@@ -325,7 +327,9 @@ class CgxmlDialog(BaseDialog):
         layout.addWidget(hint_label(self.tr(
             "Textul scris în DXF în interiorul fiecărui poligon. Fiecare coloană "
             "bifată devine un rând al etichetei (dublu clic pe prefix sau sufix "
-            "pentru a-l modifica).")))
+            "pentru a-l modifica). Eticheta unui imobil se pune în partea lui "
+            "neacoperită de construcții, iar textul construcțiilor are cel mult 1,5 m "
+            "înălțime, al imobilelor cel mult 2,5 m.")))
         try:
             stored = json.loads(dialog_memory.load("CgxmlDialog", "labels", "") or "{}")
         except (TypeError, ValueError):
@@ -443,24 +447,10 @@ class CgxmlDialog(BaseDialog):
                 first, second, stored)
 
     def _run(self):
+        if not self.sources_ready([(self.source, "")], self._run):
+            return
         paths = self.source.paths()
-        # counted on a worker thread when the path was set; count() waits for a count still
-        # in progress, so the run lists no folder here
-        count = self.source.count() if paths else None
-        if not paths or self.source.missing():
-            self.warn(self.tr("Alegeți folderul, arhiva ZIP sau fișierele CGXML."),
-                      self.source.edit)
-            return
-        if count == 0:
-            self.warn(self.tr("Nu s-a găsit niciun fișier .cgxml în sursa aleasă."),
-                      self.source.edit)
-            return
-        found = self.source.found()
-        if not found:
-            # every archive or folder of the source is damaged or cannot be read, and the
-            # status line under the field names them
-            self.warn(self.source.status.text(), self.source.edit)
-            return
+        found, _problem, _unreadable = self.source.outcome()
         output_dir = self.output_row.path()
         if not output_dir:
             self.warn(self.tr("Alegeți folderul de ieșire."), self.output_row.edit)
@@ -484,12 +474,14 @@ class CgxmlDialog(BaseDialog):
         if same:
             self.warn(same, self.name_constructii)
             return
-        if fmt_key == "dxf" and not deps.ensure("ezdxf", self):
-            return
 
         targets = self._targets(fmt_key, output_dir, base)
-        if not self.confirm_overwrite(targets) or not self.release_files(targets):
+        if not self.confirm_overwrite(targets):
             return
+        removed = self._described(self.layers_reading(targets))
+        if not self.release_files(targets):
+            return
+        self._removed = removed
 
         self._save_choices(layouts, names)
         label_config = {w: tree.config() for w, tree in self.labels.items()}
@@ -516,6 +508,10 @@ class CgxmlDialog(BaseDialog):
 
     def _on_finished(self, ok, task):
         self.task_done()
+        removed, self._removed = self._removed, []
+        if not ok:
+            # the files of the previous result are as they were
+            self._put_back(removed)
         # a cancel that came after the outputs were put in place leaves a complete run
         if not ok and task.isCanceled():
             self.notice(self.tr("Conversia a fost anulată."))
@@ -559,6 +555,8 @@ class CgxmlDialog(BaseDialog):
             ).format(fmt.count(task.invalid, self.tr("poligon"), self.tr("poligoane"))))
         if task.truncated:
             notes.append(cgxml_export.truncated_note(task.truncated))
+        if task.cut_cells:
+            notes.append(xlsx_report.cut_note(task.cut_cells))
         notes.extend(task.write_notes)
         report = self.report_notes(task)
         notes.extend(report)
@@ -575,8 +573,52 @@ class CgxmlDialog(BaseDialog):
             notes.append(self.tr("Lista completă a problemelor este în detalii."))
         self.show_result(headline, notes=notes, file_path=task.outputs.get("file"),
                          details=details or None,
-                         warning=bool(task.errors or task.write_notes or report or no_names),
+                         warning=bool(task.errors or task.write_notes or task.cut_cells
+                                      or report or no_names),
                          layers=added)
+
+    @staticmethod
+    def _described(layers) -> list:
+        """For each vector layer, what _put_back() needs to add it again unchanged: (source,
+        name, provider, style, name of its group or "", place in the group, shown)."""
+        root = QgsProject.instance().layerTreeRoot()
+        described = []
+        for layer in layers:
+            node = root.findLayer(layer.id())
+            if node is None or not isinstance(layer, QgsVectorLayer):
+                continue
+            group = node.parent()
+            place = [child.layerId() if hasattr(child, "layerId") else None
+                     for child in group.children()].index(layer.id())
+            style = QgsMapLayerStyle()
+            style.readFromLayer(layer)
+            described.append((layer.source(), layer.name(), layer.providerType(), style,
+                              group.name() if group.parent() is not None else "", place,
+                              node.itemVisibilityChecked()))
+        return described
+
+    @staticmethod
+    def _put_back(described):
+        """Add the _described() layers to the project again, each with its style, in its
+        group and place, shown or hidden as it was."""
+        project = QgsProject.instance()
+        root = project.layerTreeRoot()
+        # by place, so that a layer finds before it the layers that were before it
+        for source, name, provider, style, group_name, place, shown in sorted(
+                described, key=lambda entry: entry[5]):
+            options = QgsVectorLayer.LayerOptions()
+            options.loadDefaultStyle = False
+            layer = QgsVectorLayer(source, name, provider, options)
+            if not layer.isValid():
+                continue
+            style.writeToLayer(layer)
+            project.addMapLayer(layer, False)
+            group = root.findGroup(group_name) if group_name else None
+            # compared with None: on QGIS 4 a group without children is false
+            if group is None:
+                group = root
+            node = group.insertLayer(min(place, len(group.children())), layer)
+            node.setItemVisibilityChecked(shown)
 
     def _load_layers(self, task):
         """Style and mark the output layers, save that with their files, and add them to the
@@ -603,3 +645,21 @@ class CgxmlDialog(BaseDialog):
         if not self.add_to_project.isChecked():
             return []
         return _ui_helpers.add_layers(layers, task.base_name, report=False)
+
+    def dispose(self):
+        removed, self._removed = self._removed, []
+        task = self._task
+        super().dispose()
+        # a canceled run may already be moving its outputs onto the files of the removed
+        # layers; the layers come back once it has left its thread
+        tasks.wait_for([task] if task is not None else [], tasks.UNLOAD_WAIT)
+        self._put_back(removed)
+
+    def project_changed(self):
+        super().project_changed()
+        # the layers removed for the run in progress belong to the project that was closed
+        self._removed = []
+        # the typed file name was for the closed project's source; propose one for the
+        # current source
+        self.base_edit.clear()
+        self._on_source_changed()

@@ -4,19 +4,22 @@
 """Topologie Construcții: cuts construcții back inside their imobil.
 
 A construcție belongs to the imobil named in its link column, else to the imobil it overlaps
-most. Each part of a multipart construcție is cut on its own. An invalid construcție is not
-cut.
+most, and is cut when it lies outside that imobil by more than the tolerance. The placement
+and the rule, topology_check_service.outside(), are those of Verificare Topologică, so with
+the same tolerance a construcție is cut exactly when that check reports it.
+Each part of a multipart construcție is cut on its own. An invalid construcție is not cut.
 """
 
-from qgis.core import (  # type: ignore
-    Qgis, QgsFeature, QgsField, QgsFields, QgsGeometry, QgsSpatialIndex,
-)
+from qgis.core import Qgis, QgsFeature, QgsField, QgsFields, QgsGeometry  # type: ignore
 
-from . import fmt
+from . import fmt, overlay
 from .compare_service import normalize_key
 from .layer_sources import unique_name
 from .tasks import CadexTask
-from .topology_check_service import clean, validity_problem
+from .topology_check_service import (
+    BUILDING_TOLERANCE, Building, Coverage, Parcel, clean, outside, placement, unnamed,
+    validity_problem,
+)
 from ..qt_compat import FIELD_DOUBLE, FIELD_STRING
 
 UNCHANGED = "Neschimbată"
@@ -31,7 +34,7 @@ STATE_COLORS = {UNCHANGED: "#8A93A1", FIXED: "#2E9E5B", LOSS: "#E3A008",
                 ELSEWHERE: "#AE3EC9", NO_PARCEL: "#D64545", NO_GEOMETRY: "#495057",
                 FAILED: "#7B3FB0"}
 
-# area changes below this are floating-point noise from the intersection
+# mp; a piece of an intersection smaller than this is floating-point noise
 AREA_EPSILON = 1e-6
 
 JOIN_PREFIX = "imb_"
@@ -57,25 +60,29 @@ def largest_polygon(geometry):
     return max(polygons, key=lambda p: p.area()), len(polygons)
 
 
-def cut(geometry, parcel, shrunk):
+def cut(geometry, parcel, shrunk, tolerance):
     """(the construcție cut back inside the shrunk imobil, or None when nothing is left; the
-    number of
-    pieces of the part the cut split most). Each part is cut on its own: a part inside the
-    imobil parcel stays as it is, and when the cut splits a part, its largest piece is kept."""
-    kept, pieces = [], 0
+    number of pieces of the part the cut split most; the number of parts of which nothing is
+    left). Each part is cut on its own: a part that does not lie outside the imobil parcel by
+    more than tolerance stays as it is, and when the cut splits a part, its largest piece is
+    kept."""
+    kept, pieces, removed = [], 0, 0
     for part in _flatten(geometry):
         if part.isEmpty() or part.type() != Qgis.GeometryType.Polygon:
             continue
-        if part.within(parcel):
+        if outside(part, parcel, tolerance) is None:
             kept.append(part)
             continue
-        piece, count = largest_polygon(part.intersection(shrunk))
+        piece, count = largest_polygon(overlay.intersection(part, shrunk))
         pieces = max(pieces, count)
-        if piece is not None:
+        if piece is None:
+            removed += 1
+        else:
             kept.append(piece)
     if not kept:
-        return None, pieces
-    return (kept[0] if len(kept) == 1 else QgsGeometry.collectGeometry(kept)), pieces
+        return None, pieces, removed
+    result = kept[0] if len(kept) == 1 else QgsGeometry.collectGeometry(kept)
+    return result, pieces, removed
 
 
 def output_fields(source_fields: QgsFields, join_fields):
@@ -127,26 +134,29 @@ class BuildingTopologyTask(CadexTask):
     layers are built on the main thread."""
 
     def __init__(self, *, imobile, constructii, buffer_m, threshold, join_fields,
-                 link_field=None, key_field=None, finished_cb=None):
+                 link_field=None, key_field=None, tolerance=BUILDING_TOLERANCE,
+                 finished_cb=None):
         super().__init__("CADex: Topologie Construcții", finished_cb)
         self.imobile = imobile
         self.constructii = constructii
         self.buffer_m = buffer_m
         self.threshold = threshold
+        # how far a construcție may lie outside its imobil without a cut
+        self.tolerance = tolerance
         self.join_fields = join_fields  # [QgsField] of the imobile layers
         # link_field in construcții holds the values of key_field in imobile
         self.link_field = link_field if key_field else None
         self.key_field = key_field
         self.results = []   # one list of row dicts per construcții snapshot
         self.counts = {state: 0 for state in STATES}
-        self._by_key = {}
+        self._shrunk = {}   # imobil index: the imobil moved inward by buffer_m
 
     def snapshots(self):
         return list(self.imobile) + list(self.constructii)
 
     def run(self):
         try:
-            parcels, index = self._index_parcels()
+            coverage, attrs = self._read_parcels()
             total = sum(s.count for s in self.constructii) or 1
             done = 0
             for snapshot in self.constructii:
@@ -161,7 +171,7 @@ class BuildingTopologyTask(CadexTask):
                     else:
                         link = (normalize_key(feature.attributes()[link_index])
                                 if link_index >= 0 else None)
-                        rows.append(self._fix(feature, geometry, parcels, index, link))
+                        rows.append(self._fix(feature, geometry, coverage, attrs, link))
                     done += 1
                     if done % 50 == 0:
                         self.report(10.0 + 90.0 * done / total)
@@ -170,34 +180,32 @@ class BuildingTopologyTask(CadexTask):
         except Exception as e:
             return self.failed("Topologie Construcții", e)
 
-    def _index_parcels(self):
-        parcels = {}
-        index = QgsSpatialIndex()
-        next_id = 0
+    def _read_parcels(self):
+        """(the imobile as a Coverage, named as Verificare Topologică names them; the join
+        attributes of each)."""
+        parcels, attrs = [], []
         join_names = [f.name() for f in self.join_fields]
         for snapshot in self.imobile:
             key_index = snapshot.fields.lookupField(self.key_field) if self.key_field else -1
             for feature, geometry in snapshot.features():
                 key = normalize_key(feature.attributes()[key_index]) if key_index >= 0 else None
-                if key is not None:
-                    self._by_key.setdefault(key, []).append(next_id)
-                if not geometry.isGeosValid():
-                    geometry = geometry.makeValid()
-                shrunk = geometry.buffer(-self.buffer_m, 8)
-                if shrunk is not None and not shrunk.isEmpty() and not shrunk.isGeosValid():
-                    shrunk = shrunk.makeValid()
-                if shrunk is None or shrunk.isEmpty():
-                    # an imobil narrower than twice the buffer disappears; keep its boundary
-                    shrunk = geometry
-                attrs = {name: feature[name] for name in join_names
-                         if snapshot.fields.lookupField(name) >= 0}
-                parcels[next_id] = (geometry, shrunk, attrs, key)
-                index.addFeature(next_id, geometry.boundingBox())
-                next_id += 1
+                parcels.append(Parcel(key or unnamed(snapshot, feature), None,
+                                      QgsGeometry(geometry), key=key))
+                attrs.append({name: feature[name] for name in join_names
+                              if snapshot.fields.lookupField(name) >= 0})
         self.report(10.0)
-        return parcels, index
+        return Coverage(parcels), attrs
 
-    def _fix(self, feature, geometry, parcels, index, link=None):
+    def _moved_inward(self, coverage, i):
+        """The imobil with index i shrunk by buffer_m; the imobil itself when it is narrower
+        than twice buffer_m and nothing of it would be left."""
+        if i not in self._shrunk:
+            parcel = coverage.parcels[i].clean
+            shrunk = clean(parcel.buffer(-self.buffer_m, 8))
+            self._shrunk[i] = parcel if shrunk is None else shrunk
+        return self._shrunk[i]
+
+    def _fix(self, feature, geometry, coverage, attrs, link=None):
         row = {"attrs": feature.attributes(), "geometry": QgsGeometry(geometry),
                "join": {}}
         problem = validity_problem(geometry)
@@ -209,46 +217,30 @@ class BuildingTopologyTask(CadexTask):
                                 f"Geometrie invalidă: {problem[0]}. Nu a fost tăiată.")
         area = geometry.area()
         row["sup_inainte"] = round(area, 4)
-        cover = {}
-        for candidate in index.intersects(geometry.boundingBox()):
-            parcel = parcels[candidate][0]
-            if not parcel.intersects(geometry):
-                continue
-            overlap = geometry.intersection(parcel)
-            overlap_area = overlap.area() if overlap is not None else 0.0
-            if overlap_area > 0:
-                cover[candidate] = overlap_area
-        best = max(cover, key=lambda c: cover[c]) if cover else None
-
+        own, best, cover, link_found = placement(
+            Building("", geometry, link=link, clean=geometry), coverage)
         remark = ""
-        if link is not None:
-            matches = self._by_key.get(link)
-            if matches:
-                own = max(matches, key=lambda c: cover.get(c, 0.0))
-                if best is not None and best != own and cover[best] > cover.get(own, 0.0):
-                    # not cut: cutting would keep it on the wrong imobil
-                    other = parcels[best][3] or "?"
-                    return self._finish(
-                        row, ELSEWHERE, area,
-                        f"Aparține imobilului {link}, dar stă în cea mai mare parte pe "
-                        f"imobilul {other} ({fmt.area(cover[best], 2)} din "
-                        f"{fmt.area(area, 2)}). Nu a fost tăiată.")
-                best = own if cover.get(own) else best
-            elif best is None:
-                remark = f" Imobilul '{link}' nu a fost găsit."
-            else:
-                remark = (f" Imobilul '{link}' nu a fost găsit; s-a folosit imobilul pe "
-                          "care se află.")
-        if best is None:
+        if not link_found:
+            remark = (f" Imobilul '{link}' nu a fost găsit; s-a folosit imobilul pe care se află."
+                      if cover else f" Imobilul '{link}' nu a fost găsit.")
+        if not cover:
             return self._finish(row, NO_PARCEL, area,
                                 ("Nu se suprapune cu niciun imobil." + remark).strip())
+        if best != own and cover[best] > cover.get(own, 0.0):
+            # not cut: cutting would keep it on the wrong imobil
+            return self._finish(
+                row, ELSEWHERE, area,
+                f"Aparține imobilului {link}, dar stă în cea mai mare parte pe imobilul "
+                f"{coverage.parcels[best].label} ({fmt.area(cover[best], 2)} din "
+                f"{fmt.area(area, 2)}). Nu a fost tăiată.")
 
-        parcel, shrunk, attrs, _key = parcels[best]
-        row["join"] = attrs
-        if geometry.within(parcel):
+        parcel = coverage.parcels[own].clean
+        row["join"] = attrs[own]
+        if outside(geometry, parcel, self.tolerance) is None:
             return self._finish(row, UNCHANGED, area, remark.strip())
         try:
-            result, pieces = cut(geometry, parcel, shrunk)
+            result, pieces, removed = cut(geometry, parcel, self._moved_inward(coverage, own),
+                                          self.tolerance)
         except Exception as e:
             return self._finish(row, FAILED, None, f"Eroare la tăiere: {str(e)[:120]}")
         if result is None:
@@ -256,14 +248,18 @@ class BuildingTopologyTask(CadexTask):
                                 "După tăiere nu a rămas nimic din construcție.")
         after = result.area()
         lost = area - after
-        if lost <= AREA_EPSILON:
-            return self._finish(row, UNCHANGED, area, remark.strip())
         row["geometry"] = result
         note = f"Pierde {fmt.area(lost, 4)} ({fmt.percent(100.0 * lost / area)}).{remark}"
         if pieces > 1:
             what = ("construcția" if geometry.constGet().partCount() == 1
                     else "o parte a construcției")
             note += f" Tăierea a împărțit {what} în {pieces} părți; s-a păstrat cea mai mare."
+        if removed:
+            note += fmt.plural(
+                removed,
+                " O parte a construcției a fost eliminată: după tăiere nu a rămas nimic din ea.",
+                " {0} ale construcției au fost eliminate: după tăiere nu a rămas nimic din "
+                "ele.").format(fmt.count(removed, "parte", "părți"))
         state = LOSS if lost > self.threshold else FIXED
         return self._finish(row, state, after, note)
 

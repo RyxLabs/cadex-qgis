@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Raport Intravilan / Extravilan and Diminuare Suprafețe algorithms."""
 
+import re
 from datetime import datetime
 
 from qgis.core import (  # type: ignore
@@ -16,9 +17,14 @@ from qgis.core import (  # type: ignore
 
 from .base import FIELD_ANY, NUMBER_DOUBLE, SOURCE_POLYGON, SOURCE_VECTOR, CadexAlgorithm
 from ..qt_compat import FIELD_DOUBLE, is_null
-from ..services import diminuare_service, fmt, intravilan_service, layer_style, stereo70, xlsx
+from ..services import (
+    diminuare_service, fmt, intravilan_service, layer_style, stereo70, xlsx, xlsx_report,
+)
 from ..services.layer_sources import SKIP_VALIDITY_CHECKS, unique_name
 from ..services.tasks import CadexTask
+
+# the names OGR gives the columns of a table without column names on its first row
+GENERATED_NAME = re.compile(r"^[Ff]ield_?\d+$")
 
 
 class IntravilanAlgorithm(CadexAlgorithm):
@@ -88,6 +94,8 @@ class IntravilanAlgorithm(CadexAlgorithm):
                     fmt.count(task.skipped, self.tr("imobil"), self.tr("imobile"))))
         results = {"OUTPUT": destination}
         self.report_output(task, results, "OUTPUT_XLSX", feedback)
+        if task.cut_cells:
+            feedback.pushWarning(xlsx_report.cut_note(task.cut_cells))
         for status, key in ((intravilan_service.INTEGRAL_INTRA, "INTRAVILAN_COUNT"),
                             (intravilan_service.PARTIAL, "PARTIAL_COUNT"),
                             (intravilan_service.INTEGRAL_EXTRA, "EXTRAVILAN_COUNT")):
@@ -135,6 +143,8 @@ class AreaReductionAlgorithm(CadexAlgorithm):
             optional=True, createByDefault=False))
         self.addOutput(QgsProcessingOutputNumber("FACTOR", self.tr("Factor")))
         self.addOutput(QgsProcessingOutputNumber("REDUCTION_PCT", self.tr("Diminuare (%)")))
+        self.addOutput(QgsProcessingOutputNumber(
+            "SURPLUS", self.tr("Cu cât depășește conturul suma din acte (mp)")))
 
     def prepareAlgorithm(self, parameters, context, feedback):
         # the .xlsx file and sheet the table reads, for the rows hidden in Excel
@@ -151,17 +161,29 @@ class AreaReductionAlgorithm(CadexAlgorithm):
                     self._sheet = (path, parts.get("layerName") or None, parts.get("layerId"))
         return super().prepareAlgorithm(parameters, context, feedback)
 
+    def _sheet_read(self):
+        """(the name of the .xlsx sheet OGR reads the table from, the names of all the sheets);
+        (None, []) for a table that is not an .xlsx sheet. A source that names no sheet is the
+        file's first one, hidden in Excel or not."""
+        if not self._sheet:
+            return None, []
+        path, sheet, index = self._sheet
+        names = xlsx.sheet_names(path)
+        if sheet is None:
+            position = int(index) if index not in (None, "") else 0
+            sheet = names[position] if 0 <= position < len(names) else None
+        return sheet, names
+
     def _hidden_rows(self, feedback) -> set:
         """The Excel numbers of the rows hidden in the table's .xlsx sheet, by a filter or by
         hand. OGR gives each row of a sheet its Excel row number as fid."""
         if not self._sheet:
             return set()
-        path, sheet, index = self._sheet
         try:
-            if sheet is None and index not in (None, ""):
-                names = xlsx.sheet_names(path)
-                sheet = names[int(index)] if 0 <= int(index) < len(names) else None
-            return set(xlsx.read_table(path, sheet)[2])
+            sheet, _names = self._sheet_read()
+            if sheet is None:
+                return set()
+            return set(xlsx.read_table(self._sheet[0], sheet)[2])
         except Exception:
             # OGR could open the table, so a failure here only loses the hidden-row check
             feedback.pushWarning(self.tr(
@@ -211,6 +233,24 @@ class AreaReductionAlgorithm(CadexAlgorithm):
             used = "tot layerul ({0})".format(fmt.count(len(geometries), "element", "elemente"))
         return area, f"{name}, {used}"
 
+    def _missing_column(self, field, table_name, header) -> str:
+        """The sentence for a column the table lacks: a name kept in a model or a script, or
+        a table whose column names OGR did not find on its first row."""
+        message = self.tr("Tabelul '{0}' nu are coloana '{1}'. Coloanele lui sunt: {2}.").format(
+            table_name, field, ", ".join(header))
+        if header and all(GENERATED_NAME.match(name) for name in header):
+            message += " " + self.tr(
+                "Numele coloanelor nu au fost găsite pe primul rând al tabelului.")
+        try:
+            sheet, names = self._sheet_read()
+        except Exception:
+            # the sheets only complete the message
+            sheet, names = None, []
+        if sheet is not None and len(names) > 1:
+            message += " " + self.tr("S-a citit foaia '{0}'; fișierul are și: {1}.").format(
+                sheet, ", ".join(f"'{name}'" for name in names if name != sheet))
+        return message
+
     def processAlgorithm(self, parameters, context, feedback):
         table = self.parameterAsSource(parameters, "TABLE", context)
         if table is None:
@@ -219,6 +259,10 @@ class AreaReductionAlgorithm(CadexAlgorithm):
         table_name = info.name if info is not None else table.sourceName()
         area_field = self.field_name(parameters, "AREA_FIELD", context)
         fixed_field = self.field_name(parameters, "FIXED_FIELD", context)
+        header = table.fields().names()
+        for field in (area_field, fixed_field):
+            if field and field not in header:
+                raise QgsProcessingException(self._missing_column(field, table_name, header))
         if info is not None:
             self.refuse_row_number(area_field, info, self.tr(
                 "Coloana '{0}' din '{1}' doar numerotează rândurile și nu conține suprafețele "
@@ -235,7 +279,6 @@ class AreaReductionAlgorithm(CadexAlgorithm):
             raise QgsProcessingException(self.tr(
                 "Alegeți layerul contur sau scrieți suprafața conturului."))
 
-        header = table.fields().names()
         hidden = self._hidden_rows(feedback)
         rows, geometries, fids, left_hidden = [], [], [], []
         # every row counts in the reduction, whatever its geometry; the geometry is only copied
@@ -262,14 +305,33 @@ class AreaReductionAlgorithm(CadexAlgorithm):
         flags = [diminuare_service.has_value(r[fixed_col]) if fixed_col is not None else False
                  for r in rows]
         decimals = self.ROUNDING[self.parameterAsEnum(parameters, "ROUNDING", context)]
-        result = diminuare_service.compute(areas, flags, area, decimals,
-                                           diminuare_service.total_rows(rows))
+        candidates = diminuare_service.total_candidates(rows)
+        totals = diminuare_service.total_rows(rows, areas, candidates)
+        result = diminuare_service.compute(areas, flags, area, decimals, totals)
         if result.error:
             raise QgsProcessingException(result.error)
+        note = diminuare_service.sum_note(result)
+        if note:
+            feedback.pushInfo(note)
         # the fid, since row numbers depend on the source format
+        reasons = {
+            diminuare_service.TOTAL_BY_WORD: self.tr(
+                "Elementul cu fid {0} este un rând de total sau subtotal și nu intră în "
+                "diminuare."),
+            diminuare_service.TOTAL_BY_SUM: self.tr(
+                "Elementul cu fid {0} este un rând de total sau subtotal, cu suprafața egală "
+                "cu suma rândurilor de deasupra, și nu intră în diminuare."),
+            diminuare_service.TOTAL_BY_LABEL: self.tr(
+                "Elementul cu fid {0} este un rând de total sau subtotal, doar cu denumirea și "
+                "numere, fără datele unei parcele, și nu intră în diminuare.")}
         for i in result.left_out:
-            feedback.pushWarning(self.tr("Elementul cu fid {0} este un rând de total sau "
-                                         "subtotal și nu intră în diminuare.").format(fids[i]))
+            feedback.pushWarning(reasons[totals[i]].format(fids[i]))
+        for i in candidates:
+            if i not in totals:
+                feedback.pushWarning(self.tr(
+                    "Elementul cu fid {0} conține cuvântul 'total' sau 'sumă' și rămâne parcelă: "
+                    "are datele unei parcele, iar suprafața lui nu este suma rândurilor de "
+                    "deasupra.").format(fids[i]))
         negative = set(result.negative_rows)
         for i in result.bad_rows:
             if i in negative:
@@ -308,7 +370,7 @@ class AreaReductionAlgorithm(CadexAlgorithm):
         self.write(sink, out, feedback)
 
         results = {"OUTPUT": destination, "FACTOR": result.factor,
-                   "REDUCTION_PCT": result.reduction_pct}
+                   "REDUCTION_PCT": result.reduction_pct, "SURPLUS": result.surplus}
         excel = self.parameterAsFileOutput(parameters, "OUTPUT_XLSX", context)
         if excel:
             meta = [("Data", datetime.now().strftime("%d.%m.%Y %H:%M")),
@@ -321,9 +383,14 @@ class AreaReductionAlgorithm(CadexAlgorithm):
                 meta.append(("Rânduri ascunse în Excel, lăsate deoparte",
                              fmt.count(len(left_hidden), "rând", "rânduri") + ": "
                              + diminuare_service.row_list(left_hidden)))
+            if totals:
+                meta.append(("Rânduri de total, lăsate deoparte (fid)",
+                             diminuare_service.total_list(totals, lambda i: str(fids[i]))))
             report = CadexTask("CADex: Diminuare Suprafețe")
             report.excel_path = excel
-            report.write_report(lambda: diminuare_service.write_excel(
+            cut = report.write_report(lambda: diminuare_service.write_excel(
                 excel, header, rows, result, meta, area_col, fixed_col), excel)
             self.report_output(report, results, "OUTPUT_XLSX", feedback)
+            if cut:
+                feedback.pushWarning(xlsx_report.cut_note(cut))
         return results

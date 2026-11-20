@@ -3,11 +3,13 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """The plugin class: toolbar, menu and actions, built from the catalog in features.py."""
 
-from qgis.PyQt.QtCore import QCoreApplication  # type: ignore
+import weakref
+
+from qgis.PyQt.QtCore import QCoreApplication, QEvent, QObject  # type: ignore
 from qgis.core import Qgis, QgsApplication, QgsMessageLog  # type: ignore
 
-from . import features
-from .services import settings_service
+from . import features, icons
+from .services import dialog_memory, settings_service, tasks
 
 PLUGIN_NAME = "CADex"
 
@@ -19,6 +21,23 @@ WITHOUT_PATTERNS = ("convert_cgxml", "open_help")
 def _name_patterns() -> tuple:
     return tuple(settings_service.get(key)
                  for key in settings_service.LAYER_ROLES + settings_service.FIELD_ROLES)
+
+
+class _PaletteWatch(QObject):
+    """Event filter that calls a method back when the palette of the widget it watches
+    changes. The method is held weakly: the filter belongs to the watched widget, which the
+    main window owns, and must not keep the plugin object alive through it."""
+
+    def __init__(self, method, parent):
+        super().__init__(parent)
+        self._method = weakref.WeakMethod(method)
+
+    def eventFilter(self, _watched, event):
+        if event.type() == QEvent.Type.PaletteChange:
+            method = self._method()
+            if method is not None:
+                method()
+        return False
 
 
 class Cadex:
@@ -37,6 +56,9 @@ class Cadex:
         # the Setări window while it is open
         self._settings = None
         self._tooltips = {}
+        # whether the actions carry the icons for a dark palette
+        self._dark = False
+        self._palette_watch = None
 
     def tr(self, text: str) -> str:
         return QCoreApplication.translate("CADex", text)
@@ -59,6 +81,7 @@ class Cadex:
         from .dialogs import _ui_helpers
 
         self.initProcessing()
+        dialog_memory.watch_project()
         self.toolbar = self.iface.addToolBar(PLUGIN_NAME)
         self.toolbar.setObjectName("CADexToolbar")
 
@@ -98,6 +121,12 @@ class Cadex:
         for action in self.actions.values():
             action.changed.connect(self._restore_tooltips)
 
+        # the QGIS theme and, on Qt6, the system's light or dark mode can change while QGIS
+        # runs; the toolbar gets a PaletteChange event then, as every widget does
+        self._dark = icons.dark_ui()
+        self._palette_watch = _PaletteWatch(self._follow_palette, self.toolbar)
+        self.toolbar.installEventFilter(self._palette_watch)
+
         if not settings_service.get("general/welcome_shown"):
             settings_service.set_("general/welcome_shown", True)
             self._show_welcome()
@@ -106,12 +135,16 @@ class Cadex:
         if self.provider is not None:
             QgsApplication.processingRegistry().removeProvider(self.provider)
             self.provider = None
+        canceled = []
         for dialog in list(self._dialogs.values()) + [self._settings]:
             try:
                 if dialog is not None:
+                    canceled.append(getattr(dialog, "_task", None))
                     dialog.dispose()
             except RuntimeError:
                 pass  # already destroyed
+        tasks.wait_for([task for task in canceled if task is not None], tasks.UNLOAD_WAIT)
+        dialog_memory.unwatch_project()
         self._dialogs.clear()
         self._built_with.clear()
         self._settings = None
@@ -128,11 +161,29 @@ class Cadex:
         self.actions.clear()
         if self.toolbar is not None:
             try:
+                if self._palette_watch is not None:
+                    # the toolbar is deleted later; until then none of its events calls
+                    # into Python
+                    self.toolbar.removeEventFilter(self._palette_watch)
                 self.iface.mainWindow().removeToolBar(self.toolbar)
                 self.toolbar.deleteLater()
             except RuntimeError:
                 pass
             self.toolbar = None
+            self._palette_watch = None
+
+    def _follow_palette(self):
+        """Give the actions the icon variant of the palette in use."""
+        dark = icons.dark_ui()
+        if dark == self._dark:
+            return
+        self._dark = dark
+        for feat in features.CATALOG:
+            try:
+                if feat.method in self.actions:
+                    self.actions[feat.method].setIcon(icons.icon(feat.icon))
+            except RuntimeError:
+                pass  # unloaded in the meantime
 
     def _restore_tooltips(self):
         for method, action in self.actions.items():
@@ -159,7 +210,8 @@ class Cadex:
             pass
 
     def _show_tool(self, method, dialog_class):
-        """Show the tool's window, reusing the open one. Closing only hides it."""
+        """Show the tool's window, reusing the open one. Closing only hides it; a hidden
+        window takes the palette in use when it is shown again."""
         dialog = self._dialogs.get(method)
         if dialog is not None:
             try:
@@ -168,7 +220,9 @@ class Cadex:
                 dialog.activateWindow()
                 return dialog
             except RuntimeError:
+                # already destroyed
                 self._dialogs.pop(method, None)
+                self._built_with.pop(method, None)
         dialog = dialog_class(iface=self.iface, parent=self.iface.mainWindow())
         dialog.help_requested.connect(self.show_help)
         self._dialogs[method] = dialog

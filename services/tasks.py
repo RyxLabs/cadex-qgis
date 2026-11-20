@@ -8,11 +8,16 @@ thread and connects its feedback through stop_hook and progress_hook.
 """
 
 import os
+import time
 import traceback
 
 from qgis.core import Qgis, QgsMessageLog, QgsTask  # type: ignore
 
 from . import outputs
+
+# seconds the plugin's unloading waits for the tasks it cancels: the code of a task still on
+# its thread would go on after QGIS has dropped or replaced the plugin's modules
+UNLOAD_WAIT = 2.0
 
 
 def log(message, level=Qgis.MessageLevel.Info):
@@ -31,6 +36,23 @@ def file_error(path, error) -> str:
                 "aveți drept de acces la el.")
     reason = getattr(error, "strerror", None) or str(error) or error.__class__.__name__
     return f"{noun} '{name}' nu poate fi deschis: {reason}."
+
+
+def wait_for(tasks, seconds: float):
+    """Block until the canceled tasks have left their threads, seconds at most for all of
+    them. Only a running task is waited for: a canceled one that has not started never runs,
+    and QgsTask.waitForFinished() would wait for its start without a time limit."""
+    end = time.monotonic() + seconds
+    for task in tasks:
+        left = end - time.monotonic()
+        if left <= 0:
+            break
+        try:
+            if task.status() == QgsTask.TaskStatus.Running:
+                # 0 would mean no time limit
+                task.waitForFinished(max(int(left * 1000), 1))
+        except RuntimeError:
+            pass  # deleted by the task manager, so it has ended
 
 
 class CadexTask(QgsTask):
@@ -82,16 +104,16 @@ class CadexTask(QgsTask):
                    for part in [output] + outputs.parts(output)}
         return key(path) in written
 
-    def write_report(self, write, path) -> bool:
-        """Call write(), which writes the report file path. When the file cannot be written,
-        keep the reason in report_error and return False: the run's other results stand."""
+    def write_report(self, write, path):
+        """Call write(), which writes the report file path, and return what it returns. When
+        the file cannot be written, keep the reason in report_error and return None: the run's
+        other results stand."""
         try:
-            write()
-            return True
+            return write()
         except OSError as error:
             self.report_error = outputs.write_error(path, error)
             log(f"{path}: {error}", Qgis.MessageLevel.Warning)
-            return False
+            return None
 
     def finished(self, result):
         if self.finished_cb is not None:

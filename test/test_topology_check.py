@@ -4,9 +4,13 @@
 """Verificare Topologică on hand-built sectors with known defects, and on configurations
 that resemble defects but are valid. The task also runs on layers and CGXML fixtures."""
 
+import math
 import os
 import tempfile
+import time
 import unittest
+from collections import defaultdict
+from unittest import mock
 
 import helpers
 import synthetic
@@ -15,6 +19,7 @@ helpers.start_qgis(gui=False)
 
 from qgis.core import QgsGeometry  # noqa: E402  # type: ignore
 
+from cadex.services import building_topology_service as bts  # noqa: E402
 from cadex.services import topology_check_service as tcs  # noqa: E402
 from cadex.services import xlsx  # noqa: E402
 from cadex.services.layer_sources import LayerSnapshot  # noqa: E402
@@ -24,6 +29,50 @@ square = helpers.square
 
 def box(x0, y0, x1, y1):
     return f"({x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0})"
+
+
+# the outlines of sector 1, x from 0 to 250, and of sector 2, x from 250 to 500
+WEST = QgsGeometry.fromWkt(f"POLYGON({box(0, 0, 250, 100)})")
+EAST = QgsGeometry.fromWkt(f"POLYGON({box(250, 0, 500, 100)})")
+
+
+def turned_grid(columns, rows, block):
+    """[(wkt, [id, sector])] of columns x rows adjacent imobile of 20 x 50 m, in sectors of
+    block x block imobile, turned 17 degrees and rounded to the millimetre like a delivery.
+    Every other column is shifted by 25 m, so corners lie on the long edges of the
+    neighbours, which have no point there."""
+    cos, sin = math.cos(math.radians(17)), math.sin(math.radians(17))
+
+    def point(x, y):
+        return (f"{round(450000 + x * cos - y * sin, 3)!r} "
+                f"{round(350000 + x * sin + y * cos, 3)!r}")
+
+    result = []
+    for i in range(columns):
+        for j in range(rows):
+            x, y = 20.0 * i, 50.0 * j + (25.0 if i % 2 else 0.0)
+            corners = [point(x, y), point(x + 20, y), point(x + 20, y + 50), point(x, y + 50)]
+            sector = (i // block) * 1000 + j // block + 1
+            result.append((f"POLYGON(({', '.join(corners + corners[:1])}))",
+                           [str(100000 + i * rows + j), sector]))
+    return result
+
+
+def straight_grid(columns, rows, block):
+    """(imobile, outlines) at Stereo 70 coordinates: columns x rows adjacent imobile of
+    20 x 50 m as [(wkt, [id, sector])], and the rectangle around each sector of block x
+    block imobile as [(wkt, [sector])]."""
+    def rectangle(column, row, width, height):
+        x, y = 450000 + 20 * column, 350000 + 50 * row
+        return f"POLYGON({box(x, y, x + 20 * width, y + 50 * height)})"
+
+    imobile, outlines = [], {}
+    for i in range(columns):
+        for j in range(rows):
+            sector = (i // block) * 1000 + j // block + 1
+            imobile.append((rectangle(i, j, 1, 1), [str(100000 + i * rows + j), sector]))
+            outlines[sector] = (rectangle(i - i % block, j - j % block, block, block), [sector])
+    return imobile, list(outlines.values())
 
 
 def parcel(label, wkt, sector="5", key=None):
@@ -36,6 +85,16 @@ def building(label, wkt, link=None, parcel_index=None):
 
 def kinds(findings, kind):
     return [f for f in findings if f.kind == kind]
+
+
+def sector_limits(parcels, limits, min_area=tcs.MIN_AREA):
+    """The findings of check_sector_limits for the imobile parcels and the outlines limits,
+    [(sector or None, geometry)], with the outlines and gaps found first, as a check does."""
+    coverage = tcs.Coverage(parcels)
+    outlines = tcs.assign_outlines(coverage, limits)
+    gaps = tcs.check_gaps(coverage, min_area,
+                          outlines=[outline for outline in outlines if outline.members])
+    return tcs.check_sector_limits(coverage, outlines, [gap.geometry for gap in gaps], min_area)
 
 
 class SectorTests(unittest.TestCase):
@@ -57,7 +116,7 @@ class SectorTests(unittest.TestCase):
         ]
 
     def test_overlaps_with_the_road_as_a_warning(self):
-        found = {(f.subject, f.other): f for f in tcs.check_overlaps(self.parcels)}
+        found = {(f.subject, f.other): f for f in tcs.check_overlaps(tcs.Coverage(self.parcels))}
         self.assertEqual(set(found), {("imobil A", "imobil B"), ("imobil C", "imobil R")})
         self.assertAlmostEqual(found[("imobil A", "imobil B")].value, 5.0, places=3)
         self.assertEqual(found[("imobil A", "imobil B")].severity, tcs.ERROR)
@@ -65,7 +124,7 @@ class SectorTests(unittest.TestCase):
         self.assertEqual(found[("imobil C", "imobil R")].sector, "0/5")
 
     def test_gaps_have_their_true_area_with_the_enclave_taken_off(self):
-        areas = sorted(f.value for f in tcs.check_gaps(self.parcels))
+        areas = sorted(f.value for f in tcs.check_gaps(tcs.Coverage(self.parcels)))
         # the rings, not the 108 and 100 mp squares a union that ignores the enclave would report
         self.assertEqual(len(areas), 2)
         self.assertAlmostEqual(areas[0], 10.006 ** 2 - 100, places=3)
@@ -76,19 +135,19 @@ class SectorTests(unittest.TestCase):
                                               sector="99")]
         for roads, expected in (("99", tcs.WARNING), (None, tcs.ERROR), ("0", tcs.ERROR)):
             found = {(f.subject, f.other): f.severity
-                     for f in tcs.check_overlaps(parcels, roads=roads)}
+                     for f in tcs.check_overlaps(tcs.Coverage(parcels), roads=roads)}
             self.assertEqual(found[("imobil C", "imobil R")], expected, roads)
 
     def test_gap_details_name_the_imobile_around(self):
-        details = sorted(f.detail for f in tcs.check_gaps(self.parcels))
+        details = sorted(f.detail for f in tcs.check_gaps(tcs.Coverage(self.parcels)))
         self.assertTrue(all("între imobilele D, F" in d for d in details), details)
         alone = tcs.check_gaps(
-            [parcel("A", f"POLYGON({box(0, 0, 50, 50)}, {box(10, 10, 20, 20)})")])
+            tcs.Coverage([parcel("A", f"POLYGON({box(0, 0, 50, 50)}, {box(10, 10, 20, 20)})")]))
         self.assertEqual([f.detail for f in alone], ["Gol de 100 mp în interiorul imobilului A."])
 
     def test_the_edge_strip_needs_the_sector_outline(self):
-        self.assertNotIn(250.0, [round(f.value, 3) for f in tcs.check_gaps(self.parcels)])
-        found = tcs.check_sector_limits(
+        self.assertNotIn(250.0, [round(f.value, 3) for f in tcs.check_gaps(tcs.Coverage(self.parcels))])
+        found = sector_limits(
             self.parcels, [("5", QgsGeometry.fromWkt(f"POLYGON({box(0, 0, 100, 100)})"))])
         uncovered = kinds(found, tcs.UNCOVERED)
         # the rings are gaps already, only the strip is new
@@ -96,19 +155,19 @@ class SectorTests(unittest.TestCase):
         self.assertEqual(kinds(found, tcs.OUTSIDE_SECTOR), [])
 
     def test_an_outline_without_a_number_takes_the_sector_inside_it(self):
-        found = tcs.check_sector_limits(
+        found = sector_limits(
             self.parcels, [(None, QgsGeometry.fromWkt(f"POLYGON({box(0, 0, 100, 100)})"))])
         self.assertEqual([f.sector for f in kinds(found, tcs.UNCOVERED)], ["5"])
 
     def test_imobil_extending_outside_its_sector(self):
         outline = QgsGeometry.fromWkt(f"POLYGON({box(0, 0, 100, 99)})")
-        found = kinds(tcs.check_sector_limits(self.parcels, [("5", outline)]),
+        found = kinds(sector_limits(self.parcels, [("5", outline)]),
                       tcs.OUTSIDE_SECTOR)
         self.assertEqual([f.subject for f in found], ["imobil C"])
         self.assertAlmostEqual(found[0].value, 50.0, places=3)
 
     def test_ring_vertices_are_unsnapped_the_t_junction_is_not(self):
-        found = tcs.check_snapping(self.parcels)
+        found = tcs.check_snapping(tcs.Coverage(self.parcels))
         by_subject = {}
         for f in found:
             by_subject.setdefault(f.subject, []).append(f.value)
@@ -121,16 +180,16 @@ class SectorTests(unittest.TestCase):
                          [round(0.003 * 2 ** 0.5, 4)] * 4 + [round(0.2 * 2 ** 0.5, 4)] * 4)
 
     def test_vertices_of_a_reported_gap_are_not_repeated(self):
-        gaps = tcs.check_gaps(self.parcels)
-        self.assertEqual(tcs.check_snapping(self.parcels,
+        gaps = tcs.check_gaps(tcs.Coverage(self.parcels))
+        self.assertEqual(tcs.check_snapping(tcs.Coverage(self.parcels),
                                             known_gaps=[g.geometry for g in gaps]), [])
 
     def test_roads_are_left_out_of_gaps_and_snapping(self):
         roads = [parcel("R1", f"POLYGON({box(0, 0, 10, 1)})", sector="0"),
                  parcel("R2", f"POLYGON({box(10.03, 0, 20, 1)})", sector="0"),
                  parcel("R3", f"POLYGON({box(0, 1, 20, 2)})", sector="0")]
-        self.assertEqual(tcs.check_snapping(roads), [])
-        self.assertEqual(tcs.check_gaps(roads), [])
+        self.assertEqual(tcs.check_snapping(tcs.Coverage(roads)), [])
+        self.assertEqual(tcs.check_gaps(tcs.Coverage(roads)), [])
 
 
 class SnappingTests(unittest.TestCase):
@@ -142,47 +201,47 @@ class SnappingTests(unittest.TestCase):
             parcel("B", f"POLYGON({box(10, 0, 20, 5)})"),
             parcel("C", f"POLYGON({box(10, 5, 20, 10)})"),
         ]
-        self.assertEqual(tcs.check_snapping(parcels), [])
+        self.assertEqual(tcs.check_snapping(tcs.Coverage(parcels)), [])
 
     def test_open_sliver_is_caught_at_the_vertices(self):
         parcels = [parcel("A", f"POLYGON({box(0, 0, 9.97, 10)})"),
                    parcel("B", f"POLYGON({box(10, 0, 20, 10)})")]
-        found = tcs.check_snapping(parcels)
+        found = tcs.check_snapping(tcs.Coverage(parcels))
         # not enclosed, so no gap - the vertices are what shows it
-        self.assertEqual(tcs.check_gaps(parcels), [])
+        self.assertEqual(tcs.check_gaps(tcs.Coverage(parcels)), [])
         self.assertEqual(len(found), 4)
         for f in found:
             self.assertAlmostEqual(f.value, 0.03, places=4)
             self.assertIn("cu un gol între ele", f.detail)
         # a 5 cm snapping precision ignores the smaller offsets
-        self.assertEqual(tcs.check_snapping(parcels, precision=0.05), [])
+        self.assertEqual(tcs.check_snapping(tcs.Coverage(parcels), precision=0.05), [])
 
     def test_vertex_poking_into_the_neighbour(self):
         parcels = [parcel("A", "POLYGON((0 0, 10 0, 10.03 5, 10 10, 0 10, 0 0))"),
                    parcel("B", f"POLYGON({box(10, 0, 20, 10)})")]
-        found = tcs.check_snapping(parcels)
+        found = tcs.check_snapping(tcs.Coverage(parcels))
         self.assertEqual(len(found), 1)
         self.assertIn("în interiorul imobilului B", found[0].detail)
-        self.assertEqual(len(tcs.check_overlaps(parcels)), 1)
+        self.assertEqual(len(tcs.check_overlaps(tcs.Coverage(parcels))), 1)
 
     def test_millimetre_rounding_is_not_a_miss(self):
         # a rounded vertex and a rounded neighbour segment can be 1.4 mm apart
         parcels = [parcel("A", f"POLYGON({box(0, 0, 9.9985, 10)})"),
                    parcel("B", f"POLYGON({box(10, 0, 20, 10)})")]
-        self.assertEqual(tcs.check_snapping(parcels), [])
+        self.assertEqual(tcs.check_snapping(tcs.Coverage(parcels)), [])
 
     def test_wide_open_gap_up_to_half_a_metre(self):
         near = [parcel("A", f"POLYGON({box(0, 0, 9.6, 10)})"),
                 parcel("B", f"POLYGON({box(10, 0, 20, 10)})")]
-        self.assertEqual(len(tcs.check_snapping(near)), 4)
+        self.assertEqual(len(tcs.check_snapping(tcs.Coverage(near))), 4)
         far = [parcel("A", f"POLYGON({box(0, 0, 9.4, 10)})"),
                parcel("B", f"POLYGON({box(10, 0, 20, 10)})")]
-        self.assertEqual(tcs.check_snapping(far), [])
+        self.assertEqual(tcs.check_snapping(tcs.Coverage(far)), [])
 
     def test_across_numbered_sectors_it_still_counts(self):
         parcels = [parcel("A", f"POLYGON({box(0, 0, 9.97, 10)})", sector="5"),
                    parcel("B", f"POLYGON({box(10, 0, 20, 10)})", sector="6")]
-        found = tcs.check_snapping(parcels)
+        found = tcs.check_snapping(tcs.Coverage(parcels))
         self.assertEqual({f.sector for f in found}, {"5/6"})
 
 
@@ -193,7 +252,7 @@ class BuildingTests(unittest.TestCase):
                         parcel("2", f"POLYGON({box(20, 0, 40, 20)})", key="2")]
 
     def check(self, buildings, **kw):
-        return tcs.check_buildings(buildings, self.parcels, **kw)
+        return tcs.check_buildings(buildings, tcs.Coverage(self.parcels), **kw)
 
     def test_inside_and_rounding_pass(self):
         found = self.check([building("in", square(5, 5, 5), link="1"),
@@ -250,26 +309,26 @@ class ZeroThresholdTests(unittest.TestCase):
     def test_neighbours_sharing_an_edge_do_not_overlap(self):
         parcels = [parcel("A", f"POLYGON({box(0, 0, 10, 10)})"),
                    parcel("B", f"POLYGON({box(10, 0, 20, 10)})")]
-        self.assertEqual(tcs.check_overlaps(parcels, min_area=0.0), [])
+        self.assertEqual(tcs.check_overlaps(tcs.Coverage(parcels), min_area=0.0), [])
 
     def test_an_imobil_filling_its_sector_is_not_outside_it(self):
         parcels = [parcel("A", f"POLYGON({box(0, 0, 10, 10)})")]
         outline = QgsGeometry.fromWkt(f"POLYGON({box(0, 0, 10, 10)})")
-        found = tcs.check_sector_limits(parcels, [("5", outline)], min_area=0.0)
+        found = sector_limits(parcels, [("5", outline)], min_area=0.0)
         self.assertEqual(found, [])
 
     def test_buildings_sharing_a_wall_do_not_overlap(self):
         parcels = [parcel("1", f"POLYGON({box(0, 0, 20, 20)})", key="1")]
         found = tcs.check_buildings([building("a", f"POLYGON({box(2, 2, 6, 6)})", link="1"),
                                      building("b", f"POLYGON({box(6, 2, 10, 6)})", link="1")],
-                                    parcels, min_area=0.0)
+                                    tcs.Coverage(parcels), min_area=0.0)
         self.assertEqual(found, [])
 
     def test_every_finding_has_a_geometry(self):
         parcels = [parcel("A", f"POLYGON({box(0, 0, 10, 10)})"),
                    parcel("B", f"POLYGON({box(9.9, 0, 20, 10)})"),
                    parcel("C", f"POLYGON({box(20, 0, 30, 10)})")]
-        found = tcs.check_overlaps(parcels, min_area=0.0)
+        found = tcs.check_overlaps(tcs.Coverage(parcels), min_area=0.0)
         self.assertEqual([(f.subject, f.other) for f in found], [("imobil A", "imobil B")])
         self.assertTrue(all(f.geometry is not None and f.is_area for f in found))
 
@@ -281,19 +340,19 @@ class SliverTests(unittest.TestCase):
     def test_a_rounding_sliver_along_a_long_boundary_is_not_an_overlap(self):
         parcels = [parcel("A", f"POLYGON({box(0, 0, 100.001, 100)})"),
                    parcel("B", f"POLYGON({box(100, 0, 200, 100)})")]
-        self.assertEqual(tcs.check_overlaps(parcels), [])
+        self.assertEqual(tcs.check_overlaps(tcs.Coverage(parcels)), [])
 
     def test_an_overlap_wider_than_the_precision_is_reported(self):
         parcels = [parcel("A", f"POLYGON({box(0, 0, 100.003, 100)})"),
                    parcel("B", f"POLYGON({box(100, 0, 200, 100)})")]
-        found = tcs.check_overlaps(parcels)
+        found = tcs.check_overlaps(tcs.Coverage(parcels))
         self.assertEqual(len(found), 1)
         self.assertAlmostEqual(found[0].value, 0.3, places=3)
 
     def test_a_zero_precision_reports_every_sliver(self):
         parcels = [parcel("A", f"POLYGON({box(0, 0, 100.001, 100)})"),
                    parcel("B", f"POLYGON({box(100, 0, 200, 100)})")]
-        self.assertEqual(len(tcs.check_overlaps(parcels, min_width=0.0)), 1)
+        self.assertEqual(len(tcs.check_overlaps(tcs.Coverage(parcels), min_width=0.0)), 1)
 
     def test_a_rounding_gap_between_imobile_is_not_a_gap(self):
         def sector(offset):
@@ -301,21 +360,21 @@ class SliverTests(unittest.TestCase):
                     parcel("B", f"POLYGON({box(100 + offset, 0, 200, 100)})"),
                     parcel("C", f"POLYGON({box(0, 100, 200, 110)})"),
                     parcel("D", f"POLYGON({box(0, -10, 200, 0)})")]
-        self.assertEqual(tcs.check_gaps(sector(0.001)), [])
-        self.assertEqual(len(tcs.check_gaps(sector(0.003))), 1)
+        self.assertEqual(tcs.check_gaps(tcs.Coverage(sector(0.001))), [])
+        self.assertEqual(len(tcs.check_gaps(tcs.Coverage(sector(0.003)))), 1)
 
     def test_a_rounding_strip_along_the_sector_outline_is_not_reported(self):
         outline = [("5", QgsGeometry.fromWkt(f"POLYGON({box(0, 0, 100, 100)})"))]
         short = [parcel("A", f"POLYGON({box(0, 0, 100, 99.999)})")]
-        self.assertEqual(tcs.check_sector_limits(short, outline), [])
+        self.assertEqual(sector_limits(short, outline), [])
         long = [parcel("A", f"POLYGON({box(0, 0, 100, 100.001)})")]
-        self.assertEqual(tcs.check_sector_limits(long, outline), [])
+        self.assertEqual(sector_limits(long, outline), [])
 
     def test_a_rounding_sliver_between_buildings_is_not_an_overlap(self):
         parcels = [parcel("1", f"POLYGON({box(0, 0, 40, 40)})", key="1")]
         found = tcs.check_buildings([building("a", f"POLYGON({box(2, 2, 10.001, 32)})", link="1"),
                                      building("b", f"POLYGON({box(10, 2, 20, 32)})", link="1")],
-                                    parcels)
+                                    tcs.Coverage(parcels))
         self.assertEqual(found, [])
 
     def test_the_task_uses_the_snapping_precision(self):
@@ -344,7 +403,7 @@ class InvalidAndKeyTests(unittest.TestCase):
     def test_invalid_imobil_still_takes_part_in_the_other_checks(self):
         parcels = [parcel("X", "POLYGON((0 0, 10 10, 10 0, 0 10, 0 0))"),
                    parcel("Y", f"POLYGON({box(9, 0, 20, 10)})")]
-        self.assertEqual(len(tcs.check_overlaps(parcels)), 1)
+        self.assertEqual(len(tcs.check_overlaps(tcs.Coverage(parcels))), 1)
 
     def test_normalize_sector(self):
         for raw in (5, 5.0, "5", " 05 ", "5,0"):
@@ -447,8 +506,8 @@ class TopologyLimitsTests(unittest.TestCase):
         # outline, and with an outline numbered otherwise than the imobile
         for imobile, outline in ((None, None), (None, "5"), ("12", "S12")):
             parcels = self.parcels(imobile)
-            found = (tcs.check_gaps(parcels)
-                     + tcs.check_sector_limits(parcels, [(outline, self.outline)]))
+            found = (tcs.check_gaps(tcs.Coverage(parcels))
+                     + sector_limits(parcels, [(outline, self.outline)]))
             # the hole once, as a gap, and B's 500 mp outside the outline
             self.assertEqual([(f.kind, round(f.value, 3)) for f in found],
                              [(tcs.GAP, 100.0), (tcs.OUTSIDE_SECTOR, 500.0)], (imobile, outline))
@@ -457,7 +516,7 @@ class TopologyLimitsTests(unittest.TestCase):
     def test_uncovered_ground_of_an_outline_without_a_sector_names_no_unknown_sector(self):
         parcels = [parcel("A", f"POLYGON({box(0, 0, 50, 95)})", None),
                    parcel("B", f"POLYGON({box(50, 0, 100, 95)})", None)]
-        found = tcs.check_sector_limits(parcels, [(None, self.outline)])
+        found = sector_limits(parcels, [(None, self.outline)])
         self.assertEqual([f.detail for f in found],
                          ["Suprafață de 500 mp din limita sectorului, neacoperită de niciun "
                           "imobil."])
@@ -491,13 +550,13 @@ class TopologyCrackTests(unittest.TestCase):
 
     def test_a_gap_open_to_the_outside_through_a_rounding_crack_is_found(self):
         for crack in (0.0, 0.001):
-            found = tcs.check_gaps(self.sector(crack))
+            found = tcs.check_gaps(tcs.Coverage(self.sector(crack)))
             self.assertEqual([round(f.value, 3) for f in found], [400.0], crack)
             self.assertEqual(found[0].detail, "Gol de 400 mp între imobilele S, N, W, E.")
 
     def test_such_a_gap_is_not_reported_again_as_uncovered_sector_ground(self):
         outline = [("5", QgsGeometry.fromWkt(f"POLYGON({box(0, 0, 60, 60)})"))]
-        self.assertEqual(tcs.check_sector_limits(self.sector(0.001), outline), [])
+        self.assertEqual(sector_limits(self.sector(0.001), outline), [])
 
 
 class TopologyDuplicateTests(unittest.TestCase):
@@ -575,7 +634,7 @@ class TopologyExcelTests(unittest.TestCase):
                    parcel("C", f"POLYGON({box(0, 50, 50, 100)})"),
                    parcel("R", f"POLYGON({box(0, 99.9, 50, 105)})", sector="0")]
         path = os.path.join(self.tmp, "raport.xlsx")
-        tcs.write_excel(path, tcs.check_overlaps(parcels), [("Sursă", "test")])
+        tcs.write_excel(path, tcs.check_overlaps(tcs.Coverage(parcels)), [("Sursă", "test")])
         _names, rows = xlsx.read_rows(path, "Sumar")
         overlaps = [(row[1], row[2]) for row in rows if row and row[0] == tcs.OVERLAP]
         self.assertEqual(overlaps, [(tcs.ERROR, 2), (tcs.WARNING, 1)])
@@ -589,7 +648,7 @@ class TopologyBuildingPlacementTests(unittest.TestCase):
                         parcel("2", f"POLYGON({box(20, 0, 40, 20)})", sector="6", key="2")]
 
     def check(self, buildings):
-        return tcs.check_buildings(buildings, self.parcels)
+        return tcs.check_buildings(buildings, tcs.Coverage(self.parcels))
 
     def test_a_linked_building_on_no_imobil_stands_alone(self):
         found = self.check([building("far", f"POLYGON({box(120, 5, 125, 10)})", link="1")])
@@ -679,8 +738,7 @@ class TopologyTaskOutputTests(unittest.TestCase):
                                      snap_precision=0.003, roads_sector=None,
                                      excel_path=report, facts=[("Layer de imobile", "Imobile")])
         self.assertTrue(task.run(), task.error_msg)
-        _names, rows = xlsx.read_rows(report, "Sumar")
-        facts = {row[0]: row[1] for row in rows if len(row) > 1}
+        facts = helpers.summary_facts(report)
         self.assertEqual(facts["Layer de imobile"], "Imobile")
         self.assertEqual(facts["Toleranță de racordare"], "0,003 m")
         self.assertEqual(facts["Distanță de racordare"], "0,5 m")
@@ -803,14 +861,13 @@ class TopologyOutlineEdgeTests(unittest.TestCase):
     """The outlines of sectors 1 (x from 0 to 250) and 2 (x from 250 to 500), and an imobil
     X across the edge between them."""
 
-    outlines = [("1", QgsGeometry.fromWkt(f"POLYGON({box(0, 0, 250, 100)})")),
-                ("2", QgsGeometry.fromWkt(f"POLYGON({box(250, 0, 500, 100)})"))]
+    outlines = [("1", WEST), ("2", EAST)]
 
     def outside(self, wkt):
         x = parcel("X", wkt, None)
         # the interior point GEOS computes for X lies on the edge between the outlines
         self.assertEqual(x.clean.pointOnSurface().asPoint().x(), 250)
-        return [(f.sector, f.detail) for f in tcs.check_sector_limits([x], self.outlines)
+        return [(f.sector, f.detail) for f in sector_limits([x], self.outlines)
                 if f.kind == tcs.OUTSIDE_SECTOR]
 
     def test_an_imobil_on_the_edge_belongs_to_the_outline_it_overlaps_most(self):
@@ -829,9 +886,423 @@ class TopologyOutlineEdgeTests(unittest.TestCase):
         self.assertEqual(x.clean.pointOnSurface().asPoint().x(), 250)
         parcels = [x, parcel("R", f"POLYGON({box(300, 0, 500, 100)})", "2"),
                    parcel("R2", f"POLYGON({box(260, 40, 300, 100)})", "2")]
-        found = [(f.sector, f.detail) for f in tcs.check_sector_limits(parcels, self.outlines)
+        found = [(f.sector, f.detail) for f in sector_limits(parcels, self.outlines)
                  if f.kind == tcs.OUTSIDE_SECTOR]
         self.assertEqual(found, [("2", "Imobilul X iese din limita sectorului 2 cu 1.000 mp.")])
+
+
+class TopologyDissolvedOutlineTests(unittest.TestCase):
+    """Sector outlines made from the imobile themselves, as the Dissolve algorithm of QGIS
+    makes them from the sector column."""
+
+    def test_no_imobil_lies_outside_them_and_none_of_their_ground_is_uncovered(self):
+        rows = turned_grid(30, 30, 15)
+        sectors = defaultdict(list)
+        for wkt, (_number, sector) in rows:
+            sectors[sector].append(QgsGeometry.fromWkt(wkt))
+        outlines = []
+        for sector, shapes in sectors.items():
+            outline = QgsGeometry.unaryUnion(shapes)
+            outline.convertToMultiType()
+            outlines.append((outline.asWkt(17), [sector]))
+        imobile = helpers.polygon_layer("Imobile", rows, fields="id:string,sector:integer")
+        limits = helpers.polygon_layer("Sectoare", outlines, fields="nr:integer",
+                                       geometry="MultiPolygon")
+        self.assertEqual((imobile.featureCount(), limits.featureCount()), (900, 4))
+        task = tcs.TopologyCheckTask(imobile=[LayerSnapshot(imobile)], id_field="id",
+                                     sector_field="sector", limits=LayerSnapshot(limits),
+                                     limit_field="nr")
+        self.assertTrue(task.run(), task.error_msg)
+        self.assertEqual([f.detail for f in task.findings], [])
+
+
+class TopologyBetweenSectorsTests(unittest.TestCase):
+    """Sector 1 west of x = 250 and sector 2 east of it, with a 20 x 20 m hole across the
+    line between them."""
+
+    outlines = [("1", WEST), ("2", EAST)]
+
+    def parcels(self, west="1", east="2"):
+        return [parcel("A", f"POLYGON({box(0, 0, 240, 100)})", west),
+                parcel("B", f"POLYGON({box(260, 0, 500, 100)})", east),
+                parcel("C", f"POLYGON({box(240, 0, 250, 40)})", west),
+                parcel("D", f"POLYGON({box(250, 0, 260, 40)})", east),
+                parcel("E", f"POLYGON({box(240, 60, 250, 100)})", west),
+                parcel("F", f"POLYGON({box(250, 60, 260, 100)})", east)]
+
+    def test_a_hole_enclosed_by_imobile_of_two_sectors_is_a_warning(self):
+        found = tcs.check_gaps(tcs.Coverage(self.parcels()))
+        self.assertEqual([(f.kind, f.severity, f.sector, f.value) for f in found],
+                         [(tcs.GAP, tcs.WARNING, "1/2", 400.0)])
+        self.assertEqual(found[0].detail, "Gol de 400 mp între sectoarele 1 și 2, mărginit de "
+                                          "imobilele A, B, C, D, E, F.")
+        self.assertEqual(found[0].other, "A, B, C, D, ...")
+
+    def test_the_same_hole_inside_one_sector_is_an_error(self):
+        found = tcs.check_gaps(tcs.Coverage(self.parcels("1", "1")))
+        self.assertEqual([(f.severity, f.sector, f.detail) for f in found],
+                         [(tcs.ERROR, "1", "Gol de 400 mp între imobilele A, B, C, D, E, F.")])
+
+    def test_with_sector_outlines_the_hole_is_uncovered_ground_of_each_sector(self):
+        def ground(outlines):
+            task = self.task(self.parcels(), outlines)
+            return sorted((f.kind, f.severity, f.sector, f.value) for f in task.findings
+                          if f.kind in (tcs.GAP, tcs.UNCOVERED))
+        self.assertEqual(ground(self.outlines), [(tcs.UNCOVERED, tcs.ERROR, "1", 200.0),
+                                                 (tcs.UNCOVERED, tcs.ERROR, "2", 200.0)])
+        # outlines that end 5 m short of the line between the sectors: the strip of the hole
+        # between them belongs to no sector
+        apart = [("1", QgsGeometry.fromWkt(f"POLYGON({box(0, 0, 245, 100)})")),
+                 ("2", QgsGeometry.fromWkt(f"POLYGON({box(255, 0, 500, 100)})"))]
+        self.assertEqual(ground(apart), [(tcs.GAP, tcs.WARNING, "1/2", 200.0),
+                                         (tcs.UNCOVERED, tcs.ERROR, "1", 100.0),
+                                         (tcs.UNCOVERED, tcs.ERROR, "2", 100.0)])
+
+    def task(self, parcels, outlines):
+        imobile = helpers.polygon_layer(
+            "Imobile", [(p.geometry.asWkt(), [p.label, p.sector]) for p in parcels],
+            fields="id:string,sector:string")
+        limits = helpers.polygon_layer(
+            "Sectoare", [(shape.asWkt(), [sector]) for sector, shape in outlines],
+            fields="nr:string")
+        task = tcs.TopologyCheckTask(imobile=[LayerSnapshot(imobile)], id_field="id",
+                                     sector_field="sector", limits=LayerSnapshot(limits),
+                                     limit_field="nr")
+        self.assertTrue(task.run(), task.error_msg)
+        return task
+
+    def test_a_point_left_unsnapped_across_a_gap_between_sectors_is_an_error(self):
+        # a strip 5 cm wide between an imobil of sector 1 and one of sector 2, closed at both
+        # ends, with a point of the first imobil halfway along it: too narrow for a road
+        imobile = helpers.polygon_layer("Imobile", [
+            ("POLYGON((0 0, 9.95 0, 9.95 5, 9.95 10, 0 10, 0 0))", ["A", 1]),
+            (f"POLYGON({box(10, 0, 20, 10)})", ["B", 2]),
+            (f"POLYGON({box(0, 10, 20, 20)})", ["C", 1]),
+            (f"POLYGON({box(0, -10, 20, 0)})", ["D", 2])], fields="id:string,sector:integer")
+        task = tcs.TopologyCheckTask(imobile=[LayerSnapshot(imobile)], id_field="id",
+                                     sector_field="sector")
+        self.assertTrue(task.run(), task.error_msg)
+        self.assertEqual([(f.kind, f.severity, f.value) for f in task.findings],
+                         [(tcs.GAP, tcs.WARNING, 0.5), (tcs.UNSNAPPED, tcs.ERROR, 0.05)])
+
+    def test_without_a_sector_column_the_hole_is_reported_once_whatever_the_outlines(self):
+        parcels = self.parcels(None, None)
+        found = tcs.check_gaps(tcs.Coverage(parcels)) + sector_limits(parcels, self.outlines)
+        self.assertEqual([(f.kind, f.detail) for f in found],
+                         [(tcs.GAP, "Gol de 400 mp între imobilele A, B, C, D, E, F.")])
+
+    def test_a_gap_of_a_sector_enclosed_by_another_is_reported_once_in_its_own_sector(self):
+        # sector 5 is a ring around sector 6, whose only imobil has a 10 x 10 m hole
+        parcels = [parcel("5a", f"POLYGON({box(0, 0, 100, 30)})", "5"),
+                   parcel("5b", f"POLYGON({box(0, 30, 30, 70)})", "5"),
+                   parcel("5c", f"POLYGON({box(70, 30, 100, 70)})", "5"),
+                   parcel("5d", f"POLYGON({box(0, 70, 100, 100)})", "5"),
+                   parcel("6a", f"POLYGON({box(30, 30, 70, 70)}, {box(45, 45, 55, 55)})", "6")]
+        found = tcs.check_gaps(tcs.Coverage(parcels))
+        self.assertEqual([(f.severity, f.sector, f.detail) for f in found],
+                         [(tcs.ERROR, "6", "Gol de 100 mp în interiorul imobilului 6a.")])
+
+
+class TopologyOutlineMembersTests(unittest.TestCase):
+    """The outlines of sectors 1 (x from 0 to 250) and 2 (x from 250 to 500)."""
+
+    # 5.000 mp in the east outline and an arm of 200 mp into the west one, where the
+    # interior point GEOS computes for it lies
+    ARM = "POLYGON((250 0, 300 0, 300 100, 250 100, 250 51, 150 51, 150 49, 250 49, 250 0))"
+    # a delivery of sector 2 alone: no imobil of the sector of the west outline is in it
+    SECTOR_2 = [(f"POLYGON({box(250, 0, 400, 100)})", ["201", 2]),
+                (f"POLYGON({box(400, 0, 500, 100)})", ["202", 2])]
+    NOT_CHECKED = ["O limită de sector nu cuprinde niciun imobil și nu a fost verificată."]
+
+    def outside(self, parcels, outlines):
+        return [f.detail for f in sector_limits(parcels, outlines)
+                if f.kind == tcs.OUTSIDE_SECTOR]
+
+    def test_outlines_without_a_sector_are_told_apart_when_the_imobile_have_none(self):
+        # X lies half in each outline
+        parcels = [parcel("A", f"POLYGON({box(0, 0, 230, 100)})", None),
+                   parcel("X", f"POLYGON({box(230, 0, 270, 100)})", None),
+                   parcel("B", f"POLYGON({box(270, 0, 500, 100)})", None)]
+        self.assertEqual(self.outside(parcels, [(None, WEST), (None, EAST)]),
+                         ["Imobilul X iese din limita sectorului cu 2.000 mp."])
+
+    def test_an_imobil_without_a_sector_belongs_to_the_outline_it_overlaps_most(self):
+        x = parcel("X", self.ARM, None)
+        self.assertLess(x.clean.pointOnSurface().asPoint().x(), 250)
+        self.assertEqual(self.outside([x], [("1", WEST), ("2", EAST)]),
+                         ["Imobilul X iese din limita sectorului 2 cu 200 mp."])
+
+    def test_an_imobil_is_checked_against_the_outline_of_its_own_sector_only(self):
+        # no imobil carries sector 1
+        x = parcel("X", self.ARM, "2")
+        self.assertEqual(self.outside([x], [("1", WEST), ("2", EAST)]),
+                         ["Imobilul X iese din limita sectorului 2 cu 200 mp."])
+
+    def test_an_outline_that_no_checked_imobil_belongs_to_has_no_uncovered_ground(self):
+        # the imobile of sector 2 against the outlines of three sectors
+        parcels = [parcel("201", f"POLYGON({box(250, 0, 400, 100)})", "2"),
+                   parcel("202", f"POLYGON({box(400, 0, 500, 100)})", "2")]
+        far = QgsGeometry.fromWkt(f"POLYGON({box(500, 0, 750, 100)})")
+        outlines = [("1", WEST), ("2", EAST), ("3", far)]
+        self.assertEqual(sector_limits(parcels, outlines), [])
+        self.assertEqual(tcs.unmatched_sectors(parcels, outlines), ["1", "3"])
+
+    def test_an_unnumbered_outline_with_no_imobil_in_it_is_named_in_a_note(self):
+        imobile = helpers.polygon_layer(
+            "Imobile", [(f"POLYGON({box(0, 0, 250, 100)})", ["1", 7])],
+            fields="id:string,sector:integer")
+        limits = helpers.polygon_layer("Sectoare", [(WEST.asWkt(), [1]),
+                                                    (EAST.asWkt(), [2])])
+        task = tcs.TopologyCheckTask(imobile=[LayerSnapshot(imobile)], id_field="id",
+                                     sector_field="sector", limits=LayerSnapshot(limits))
+        self.assertTrue(task.run(), task.error_msg)
+        self.assertEqual(task.findings, [])
+        self.assertEqual(task.notes(), ["O limită de sector nu cuprinde niciun imobil și nu a "
+                                        "fost verificată."])
+
+    def checked_against_outlines_without_a_sector(self, imobile, outlines=None):
+        """The finished task on imobile, [(wkt, [id, sector])], and outlines, the west and
+        the east one unless given."""
+        imobile = helpers.polygon_layer("Imobile", imobile, fields="id:string,sector:integer")
+        limits = helpers.polygon_layer("Sectoare", [
+            (shape.asWkt(), [n]) for n, shape in enumerate(outlines or [WEST, EAST])])
+        task = tcs.TopologyCheckTask(imobile=[LayerSnapshot(imobile)], id_field="id",
+                                     sector_field="sector", limits=LayerSnapshot(limits))
+        self.assertTrue(task.run(), task.error_msg)
+        return task
+
+    def test_an_outline_without_a_sector_that_the_roads_fill_is_the_roads_outline(self):
+        # the road reaches 5 m past its outline
+        task = self.checked_against_outlines_without_a_sector([
+            (f"POLYGON({box(0, 0, 250, 100)})", ["A", 7]),
+            (f"POLYGON({box(250, 0, 500, 105)})", ["R", 0])])
+        self.assertEqual([f.detail for f in task.findings],
+                         ["Imobilul R iese din limita sectorului 0 cu 1.250 mp."])
+        self.assertEqual(task.notes(), [])
+
+    def test_the_roads_outline_can_be_several_polygons_that_hold_every_road_together(self):
+        # each half of the east outline is filled by one road; R2 reaches 5 m past its half
+        lower = QgsGeometry.fromWkt(f"POLYGON({box(250, 0, 500, 50)})")
+        upper = QgsGeometry.fromWkt(f"POLYGON({box(250, 50, 500, 100)})")
+        task = self.checked_against_outlines_without_a_sector([
+            (f"POLYGON({box(0, 0, 250, 100)})", ["A", 7]),
+            (f"POLYGON({box(250, 0, 500, 50)})", ["R1", 0]),
+            (f"POLYGON({box(250, 50, 500, 105)})", ["R2", 0])], [WEST, lower, upper])
+        self.assertEqual([f.detail for f in task.findings],
+                         ["Imobilul R2 iese din limita sectorului 0 cu 1.250 mp."])
+        self.assertEqual(task.notes(), [])
+
+    def test_an_outline_a_road_covers_only_partly_is_not_the_roads_outline(self):
+        # road R1 covers 1.000 of the 25.000 mp of the west outline; road R2 lies north of
+        # the east one
+        inside = (f"POLYGON({box(100, 0, 110, 100)})", ["R1", 0])
+        elsewhere = (f"POLYGON({box(250, 100, 500, 110)})", ["R2", 0])
+        for roads in ([inside, elsewhere], [inside]):
+            task = self.checked_against_outlines_without_a_sector(self.SECTOR_2 + roads)
+            self.assertEqual([f.detail for f in task.findings], [], roads)
+            self.assertEqual(task.notes(), self.NOT_CHECKED, roads)
+
+    def test_an_outline_one_road_fills_is_not_the_roads_outline_when_another_road_lies_outside_it(self):
+        # road R1 fills the east outline; road R2 lies north of the west one
+        task = self.checked_against_outlines_without_a_sector([
+            (f"POLYGON({box(0, 0, 250, 100)})", ["A", 7]),
+            (f"POLYGON({box(250, 0, 500, 100)})", ["R1", 0]),
+            (f"POLYGON({box(0, 100, 250, 110)})", ["R2", 0])])
+        self.assertEqual([f.detail for f in task.findings], [])
+        self.assertEqual(task.notes(), self.NOT_CHECKED)
+
+
+class TopologyScaleTests(unittest.TestCase):
+    """6,400 imobile in 400 sectors, each sector with its outline."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.imobile, cls.outlines = straight_grid(80, 80, 4)
+
+    def test_the_sector_limit_check_of_400_outlines_ends_in_seconds(self):
+        # when the outlines or the imobile name no sector, each imobil has to be found in an
+        # outline; trying every outline for every imobil takes 2,560,000 tests
+        named = [parcel(number, wkt, str(sector)) for wkt, (number, sector) in self.imobile]
+        unnamed = [parcel(number, wkt, None) for wkt, (number, _sector) in self.imobile]
+        shapes = [(str(sector), QgsGeometry.fromWkt(wkt)) for wkt, (sector,) in self.outlines]
+        for parcels, outlines in ((named, [(None, shape) for _sector, shape in shapes]),
+                                  (unnamed, shapes)):
+            started = time.perf_counter()
+            found = sector_limits(parcels, outlines)
+            self.assertLess(time.perf_counter() - started, 3.0)
+            self.assertEqual(found, [])
+
+    def layers(self, imobile, outlines):
+        return (helpers.polygon_layer("Imobile", imobile, fields="id:string,sector:integer"),
+                helpers.polygon_layer("Sectoare", outlines, fields="nr:integer"))
+
+    def test_a_cancelled_check_ends_at_once(self):
+        imobile, limits = self.layers(self.imobile, self.outlines)
+        task = tcs.TopologyCheckTask(imobile=[LayerSnapshot(imobile)], id_field="id",
+                                     sector_field="sector", limits=LayerSnapshot(limits))
+        asked = []
+        assign = tcs.assign_outlines
+
+        def cancelled(*args, **kwargs):
+            # cancelled as the work with the sector outlines begins
+            asked.append(time.perf_counter())
+            return assign(*args, **kwargs)
+
+        task.stop_hook = lambda: bool(asked)
+        with mock.patch.object(tcs, "assign_outlines", cancelled):
+            self.assertFalse(task.run())
+        self.assertTrue(asked)
+        self.assertLess(time.perf_counter() - asked[0], 2.0)
+
+    def test_progress_moves_while_the_sector_limits_are_checked(self):
+        imobile, limits = self.layers(*straight_grid(20, 20, 4))
+        task = tcs.TopologyCheckTask(imobile=[LayerSnapshot(imobile)], id_field="id",
+                                     sector_field="sector", limits=LayerSnapshot(limits),
+                                     limit_field="nr")
+        seen, during, checking = [], [], []
+        check = tcs.check_sector_limits
+
+        def watched(*args, **kwargs):
+            checking.append(True)
+            try:
+                return check(*args, **kwargs)
+            finally:
+                checking.clear()
+
+        def progress(percent):
+            seen.append(percent)
+            if checking:
+                during.append(percent)
+
+        task.progress_hook = progress
+        with mock.patch.object(tcs, "check_sector_limits", watched):
+            self.assertTrue(task.run(), task.error_msg)
+        self.assertEqual(seen, sorted(seen))
+        self.assertGreaterEqual(len(set(during)), 3)
+
+
+class TopologyBuildingCutTests(unittest.TestCase):
+    """Topologie Construcții and Verificare Topologică on the same construcții. Imobil 1 lies
+    from x 0 to 20, imobil 2 from x 20 to 40."""
+
+    # an imobil with a slanted south limit, and a construcție whose south wall has its two
+    # points computed on that limit
+    SLANTED = ("POLYGON((500000 400000, 500030 400010, 500030 400040, 500000 400040, "
+               "500000 400000))")
+    ON_THE_LIMIT = (f"POLYGON((500007 {400000 + 7 / 3!r}, 500016 {400000 + 16 / 3!r}, "
+                    f"500013 {400009 + 16 / 3!r}, 500004 {400009 + 7 / 3!r}, "
+                    f"500007 {400000 + 7 / 3!r}))")
+
+    def setUp(self):
+        self.imobile = helpers.polygon_layer("Imobile", [
+            (f"POLYGON({box(0, 0, 20, 20)})", ["1"]),
+            (f"POLYGON({box(20, 0, 40, 20)})", ["2"])], fields="id:string")
+
+    def both(self, rows, imobile=None, geometry="Polygon", check_tolerance=None, **cut_options):
+        """(the cut's rows, the check's findings on construcții outside their imobil) for the
+        construcții [(wkt, imobil)]."""
+        imobile = self.imobile if imobile is None else imobile
+        constructii = helpers.polygon_layer("Construcții", [(wkt, [link]) for wkt, link in rows],
+                                            fields="imobil:string", geometry=geometry)
+        cut = bts.BuildingTopologyTask(
+            imobile=[LayerSnapshot(imobile)], constructii=[LayerSnapshot(constructii)],
+            buffer_m=0.002, threshold=1.0, join_fields=[], link_field="imobil",
+            key_field="id", **cut_options)
+        self.assertTrue(cut.run(), cut.error_msg)
+        options = {} if check_tolerance is None else {"building_tolerance": check_tolerance}
+        check = tcs.TopologyCheckTask(
+            imobile=[LayerSnapshot(imobile)], constructii=[LayerSnapshot(constructii)],
+            id_field="id", link_field="imobil", **options)
+        self.assertTrue(check.run(), check.error_msg)
+        return cut.results[0], [f for f in check.findings
+                                if f.kind in (tcs.BUILDING_OUTSIDE, tcs.BUILDING_ELSEWHERE)]
+
+    def test_a_wall_on_a_slanted_limit_is_left_as_it_is(self):
+        imobile = helpers.polygon_layer("Imobile", [(self.SLANTED, ["1"])], fields="id:string")
+        # the points miss the limit by less than a thousandth of a millimetre, which is
+        # nothing at the tolerance of 1 cm and nothing with no tolerance at all
+        for options in ({}, {"check_tolerance": 0.0, "tolerance": 0.0}):
+            rows, found = self.both([(self.ON_THE_LIMIT, "1")], imobile, **options)
+            self.assertEqual(found, [], options)
+            self.assertEqual((rows[0]["stare"], rows[0]["sup_pierduta"]), (bts.UNCHANGED, 0.0),
+                             options)
+            self.assertTrue(helpers.same_geometry(rows[0]["geometry"],
+                                                  QgsGeometry.fromWkt(self.ON_THE_LIMIT)),
+                            options)
+
+    def test_an_overhang_under_the_tolerance_is_left_and_one_over_it_is_reported_and_cut(self):
+        # 9 mm and 11 mm over the limit between the two imobile, at the tolerance of 1 cm
+        rows, found = self.both([(f"POLYGON({box(15, 5, 20.009, 10)})", "1"),
+                                 (f"POLYGON({box(15, 12, 20.011, 17)})", "1")])
+        self.assertEqual([row["stare"] for row in rows], [bts.UNCHANGED, bts.FIXED])
+        self.assertEqual([f.detail for f in found], [
+            "Un punct al construcției Construcții #2 iese din imobilul 1 cu 1,1 cm "
+            "(0,055 mp în afară)."])
+        self.assertAlmostEqual(rows[1]["geometry"].boundingBox().xMaximum(), 19.998, places=6)
+
+    def test_a_wall_across_a_notch_of_the_limit_is_reported_and_cut(self):
+        # the north limit of the imobil has a notch 8 m wide and 10 m deep; the construcție
+        # spans it, with 8 x 5 m in the notch and none of its points there
+        notched = "POLYGON((0 0, 40 0, 40 40, 24 40, 24 30, 16 30, 16 40, 0 40, 0 0))"
+        imobile = helpers.polygon_layer("Imobile", [(notched, ["1"])], fields="id:string")
+        rows, found = self.both([(f"POLYGON({box(10, 25, 30, 35)})", "1")], imobile)
+        self.assertEqual([(f.detail, f.value, f.unit) for f in found], [
+            ("O latură a construcției Construcții #1 iese din imobilul 1 (40 mp în afară).",
+             40.0, "mp")])
+        self.assertEqual(rows[0]["stare"], bts.LOSS)
+        # the ground in the notch and the 2 mm of the retreat along its three sides
+        self.assertAlmostEqual(rows[0]["sup_pierduta"], 40.036, places=2)
+        self.assertTrue(rows[0]["geometry"].within(QgsGeometry.fromWkt(notched)))
+
+    def test_a_wall_across_a_notch_is_judged_by_the_width_of_the_ground_outside(self):
+        notched = "POLYGON((0 0, 40 0, 40 40, 24 40, 24 30, 16 30, 16 40, 0 40, 0 0))"
+        imobile = helpers.polygon_layer("Imobile", [(notched, ["1"])], fields="id:string")
+        # the north wall lies 9 mm past the bottom of the notch, at the tolerance of 1 cm
+        rows, found = self.both([(f"POLYGON({box(10, 25, 30, 30.009)})", "1")], imobile)
+        self.assertEqual(found, [])
+        self.assertEqual((rows[0]["stare"], rows[0]["sup_pierduta"]), (bts.UNCHANGED, 0.0))
+        # and 11 mm past it
+        rows, found = self.both([(f"POLYGON({box(10, 25, 30, 30.011)})", "1")], imobile)
+        self.assertEqual([(f.detail, f.value, f.unit) for f in found], [
+            ("O latură a construcției Construcții #1 iese din imobilul 1 (0,088 mp în afară).",
+             0.088, "mp")])
+        self.assertEqual(rows[0]["stare"], bts.FIXED)
+        self.assertTrue(rows[0]["geometry"].within(QgsGeometry.fromWkt(notched)))
+
+    def test_with_no_tolerance_every_point_outside_the_imobil_is_cut(self):
+        rows, found = self.both([(f"POLYGON({box(15, 5, 20.005, 10)})", "1")],
+                                check_tolerance=0.0, tolerance=0.0)
+        self.assertEqual([row["stare"] for row in rows], [bts.FIXED])
+        self.assertEqual([f.detail for f in found], [
+            "Un punct al construcției Construcții #1 iese din imobilul 1 cu 0,5 cm "
+            "(0,025 mp în afară)."])
+
+    def test_a_part_the_cut_removes_entirely_is_named_as_removed(self):
+        # one body inside imobil 1, one on imobil 2
+        rows, _found = self.both([(f"MULTIPOLYGON(({box(2, 2, 12, 12)}), ({box(25, 5, 30, 10)}))",
+                                   "1")], geometry="MultiPolygon")
+        self.assertEqual(rows[0]["stare"], bts.LOSS)
+        self.assertEqual(rows[0]["obs_topo"], "Pierde 25 mp (20%). O parte a construcției a "
+                                              "fost eliminată: după tăiere nu a rămas nimic "
+                                              "din ea.")
+        self.assertAlmostEqual(rows[0]["geometry"].area(), 100.0, places=6)
+
+    def test_a_neighbour_without_an_id_is_named_as_the_check_names_it(self):
+        imobile = helpers.polygon_layer("Imobile", [
+            (f"POLYGON({box(0, 0, 20, 20)})", ["1"]),
+            (f"POLYGON({box(20, 0, 40, 20)})", [None])], fields="id:string")
+        rows, found = self.both([(f"POLYGON({box(18, 5, 30, 15)})", "1")], imobile)
+        self.assertEqual([f.other for f in found], ["imobil Imobile #2"])
+        self.assertEqual(rows[0]["stare"], bts.ELSEWHERE)
+        self.assertIn("pe imobilul Imobile #2 (100 mp din 120 mp)", rows[0]["obs_topo"])
+
+    def test_a_distance_under_a_millimetre_is_shown_in_tenths_of_a_millimetre(self):
+        # two tenths of a millimetre over the limit
+        _rows, found = self.both([(f"POLYGON({box(15, 5, 20.0002, 10)})", "1")],
+                                 check_tolerance=0.0)
+        self.assertEqual([f.detail for f in found], [
+            "Un punct al construcției Construcții #1 iese din imobilul 1 cu 0,2 mm "
+            "(0,001 mp în afară)."])
 
 
 if __name__ == "__main__":

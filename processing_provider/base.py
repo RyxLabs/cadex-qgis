@@ -125,6 +125,7 @@ class CadexAlgorithm(QgsProcessingAlgorithm):
                 value = value.source
             layer = self.parameterAsVectorLayer({name: value}, name, context)
             if layer is not None:
+                layer_style.restore_from_file(layer)
                 self._layer_info[name] = LayerInfo(layer)
         return True
 

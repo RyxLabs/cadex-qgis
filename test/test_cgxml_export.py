@@ -164,6 +164,45 @@ class ShapefileTests(ConversionTest):
         note = next(f["note"] for f in imobile.getFeatures() if f["identifica"] == 10188)
         self.assertEqual(note, "ă" * 127)
         self.assertTrue(os.path.basename(task.outputs["constructii"]).endswith("_constructii.shp"))
+        # the column of the cut text has the width of the limit
+        self.assertEqual(imobile.fields().field("note").length(), 254)
+
+    def test_a_column_empty_or_short_at_conversion_takes_a_value_typed_in_afterwards(self):
+        # a file without street, tarla, title, old numbers or notes
+        source = os.path.join(self.tmp, "necompletat")
+        synthetic.write(source, "1.cgxml", synthetic.Land(
+            rings=[synthetic.square(500000, 400000, 20)], cadgenno="1",
+            buildings=[synthetic.Building(1, [synthetic.square(500002, 400002, 4)])]))
+        every_column = {which: [dict(column, on=True) for column in layout]
+                        for which, layout in layouts().items()}
+        task = self.run_task("shp", source=source, layout=every_column)
+        free_text = "ă" * 127  # 254 bytes, the most a Shapefile text holds
+        typed = {
+            "adresa": free_text, "desc_adr": free_text, "propr": free_text,
+            "alte_pers": free_text, "note": free_text,
+            "judet": "Bistrița-Năsăud", "uat": "Drobeta-Turnu Severin",
+            "localitate": "Schela Cladovei", "nr_postal": "10A", "tip_teren": "Extravilan",
+            "nr_tarla": "45/1", "nr_parcele": "1234/5, 1234/6, 1240", "categ_fol": "CC, A, V",
+            "nr_titlu": "12345/67 din 12.03.1995", "imprej": "Nu", "cad_vechi": "1234/5",
+            "cf_vechi": "560/N"}
+        self.assertEqual(helpers.typed_in(task.outputs["imobile"], typed), typed)
+        typed = {
+            "propr": free_text, "alte_pers": free_text, "note": free_text, "nr_constr": "C12",
+            "ie": "100234-C12", "tip_teren": "Extravilan", "destinatie": "CIE",
+            "dest_text": "Construcții industriale și edilitare", "are_acte": "Nu"}
+        self.assertEqual(helpers.typed_in(task.outputs["constructii"], typed), typed)
+
+    def test_a_text_column_holds_its_longest_value_whole(self):
+        # longer than a nr. poștal or a nr. tarla usually is
+        number, plot = "12-14-16-18-20-22-24-26-28-30 bis", "T" * 120
+        source = os.path.join(self.tmp, "lung")
+        synthetic.write(source, "1.cgxml", synthetic.Land(
+            rings=[synthetic.square(500000, 400000, 20)], cadgenno="1", street="Mare",
+            postal_number=number, plot=plot))
+        task = self.run_task("shp", source=source)
+        [feature] = self.layer(task, "imobile").getFeatures()
+        self.assertEqual((feature["nr_postal"], feature["nr_tarla"]), (number, plot))
+        self.assertEqual(task.truncated, 0)
 
 
 class ExcelAndDxfTests(ConversionTest):
@@ -188,25 +227,202 @@ class ExcelAndDxfTests(ConversionTest):
         _names, problems = xlsx.read_rows(path, "Probleme")
         self.assertTrue(any("empty" in (row[0] or "") for row in problems[1:]))
 
-    @unittest.skipUnless(__import__("importlib").util.find_spec("ezdxf"), "ezdxf missing")
     def test_dxf_polylines_and_labels(self):
-        import ezdxf
         labels = {"imobile": [{"key": "id", "prefix": "ID ", "suffix": "", "on": True},
                               {"key": "ie", "prefix": "IE ", "suffix": "", "on": True},
                               {"key": "sup_mas", "prefix": "", "suffix": " mp", "on": True}],
                   "constructii": [{"key": "nr_constr", "on": True}]}
         task = self.run_task("dxf", labels=labels)
-        doc = ezdxf.readfile(task.outputs["file"])
-        msp = doc.modelspace()
-        polylines = [e for e in msp if e.dxftype() == "LWPOLYLINE"]
-        texts = sorted(e.dxf.text for e in msp if e.dxftype() == "TEXT")
+        outlines, texts = drawing(task.outputs["file"])
         # 3 imobile, one of them with a hole, plus the construcție
-        self.assertEqual(len(polylines), 5)
-        self.assertIn("ID 10188", texts)
-        self.assertIn("IE 100001", texts)
-        self.assertIn("9900 mp", texts)
-        self.assertIn("C1", texts)
-        self.assertIn("CONSTRUCTII", [layer.dxf.name for layer in doc.layers])
+        self.assertEqual(sorted(layer for layer, _points, _color in outlines),
+                         ["CONSTRUCTII", "IMOBILE", "IMOBILE", "IMOBILE", "IMOBILE"])
+        self.assertEqual({layer for layer, _text in texts}, {"TEXT_IMOBILE", "TEXT_CONSTRUCTII"})
+        for text in ("ID 10188", "IE 100001", "9900 mp"):
+            self.assertIn(("TEXT_IMOBILE", text), texts)
+        self.assertIn(("TEXT_CONSTRUCTII", "C1"), texts)
+
+
+def drawing(path, placed=False):
+    """(outlines as [(layer, closed ring as points, "#rrggbb")], texts as [(layer, text)]) of
+    a DXF read through GDAL; with placed, each text is (layer, text, x, y, height)."""
+    import contextlib
+    import re
+    from osgeo import ogr
+    outlines, texts = [], []
+    # GDAL 3.7 and later warn about a call made without choosing how errors are reported
+    manager = getattr(ogr, "ExceptionMgr", contextlib.nullcontext)
+    with manager():
+        source = ogr.Open(path)
+        for feature in source.GetLayer(0):
+            geometry = feature.GetGeometryRef()
+            layer = feature.GetField("Layer")
+            if geometry.GetGeometryName() == "POINT" and placed:
+                size = re.search(r"s:([0-9.]+)g", feature.GetStyleString() or "")
+                texts.append((layer, feature.GetField("Text"), geometry.GetX(), geometry.GetY(),
+                              float(size.group(1))))
+            elif geometry.GetGeometryName() == "POINT":
+                texts.append((layer, feature.GetField("Text")))
+            else:
+                color = re.search(r"c:(#[0-9a-fA-F]{6})", feature.GetStyleString() or "")
+                outlines.append((layer, [(x, y) for x, y, *_z in geometry.GetPoints()],
+                                 color.group(1).lower() if color else None))
+        source = None
+    return outlines, texts
+
+
+class DxfDrawingTests(unittest.TestCase):
+    """The DXF drawing as a CAD program reads it: closed outlines on the layer of their kind,
+    labels as written, metres as the unit."""
+
+    SQUARE = [(500000.0, 400000.0), (500040.0, 400000.0), (500040.0, 400040.0),
+              (500000.0, 400040.0)]
+    HOLE = [(500010.0, 400010.0), (500020.0, 400010.0), (500020.0, 400020.0),
+            (500010.0, 400020.0)]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="cadex_dxf_")
+        self.path = os.path.join(self.tmp, "desen.dxf")
+
+    def tearDown(self):
+        helpers.remove_folder(self.tmp)
+
+    def write(self, texts=("ID 501",), stop=None):
+        from cadex.services import dxf_writer
+        records = [{"rings": [[[(x + 100 * n, y) for x, y in self.SQUARE]]], "text": text}
+                   for n, text in enumerate(texts)]
+        records[0]["rings"][0].append(self.HOLE)
+        return dxf_writer.write(
+            self.path, [("IMOBILE", (6, "#FF00FF"), records, lambda r: [r["text"]]),
+                        ("CONSTRUCTII", (4, "#00B8E6"), [{"rings": [[self.HOLE]]}],
+                         lambda r: [])], *([stop] if stop else []))
+
+    def test_each_ring_is_a_closed_outline_of_its_points_in_the_color_of_its_kind(self):
+        self.assertTrue(self.write())
+        outlines, _texts = drawing(self.path)
+        self.assertEqual([(layer, points[:-1]) for layer, points, _color in outlines],
+                         [("IMOBILE", self.SQUARE), ("IMOBILE", self.HOLE),
+                          ("CONSTRUCTII", self.HOLE)])
+        for _layer, points, _color in outlines:
+            self.assertEqual(points[0], points[-1])
+        self.assertEqual(outlines[0][2], "#ff00ff")
+        self.assertIsNotNone(outlines[2][2])
+        self.assertNotEqual(outlines[2][2], outlines[0][2])
+
+    def test_each_outline_gives_its_vertex_count_before_its_closed_flag(self):
+        # AutoCAD reads the closed flag (70) only after the vertex count (90); GDAL reads
+        # either order, so this is checked on the text of the file
+        self.assertTrue(self.write())
+        with open(self.path, encoding="latin-1") as fp:
+            lines = [line.strip() for line in fp]
+        pairs = list(zip(lines[0::2], lines[1::2]))
+        starts = [i for i, pair in enumerate(pairs) if pair == ("0", "LWPOLYLINE")]
+        self.assertEqual(len(starts), 3)
+        for start in starts:
+            end = next(i for i in range(start + 1, len(pairs)) if pairs[i][0] == "0")
+            codes = [code for code, _value in pairs[start:end]]
+            values = dict(pairs[start:end])
+            self.assertLess(codes.index("90"), codes.index("70"))
+            self.assertEqual(int(values["70"]) & 1, 1)
+            self.assertEqual(int(values["90"]), codes.count("10"))
+
+    def test_the_drawing_is_in_metres_and_is_all_there_is_in_its_folder(self):
+        self.assertTrue(self.write())
+        with open(self.path, encoding="latin-1") as fp:
+            lines = [line.strip() for line in fp]
+        units = lines.index("$INSUNITS")
+        # 6 is the metre
+        self.assertEqual(lines[units + 1:units + 3], ["70", "6"])
+        self.assertEqual(os.listdir(self.tmp), ["desen.dxf"])
+
+    def test_labels_keep_the_characters_of_their_text(self):
+        texts = ['POPESCU "NELU" ION', "D:\\livrare\\P1", "Brașov, Țara Bârsei, î â ă",
+                 "50% din 1/2 & <a>; b, c (d): e", "d'Artagnan ^J %%u", "x" * 300]
+        self.assertTrue(self.write(texts))
+        _outlines, written = drawing(self.path)
+        self.assertEqual(written, [("TEXT_IMOBILE", text) for text in texts])
+
+    def test_a_label_is_one_line_and_its_braces_are_parentheses(self):
+        self.assertTrue(self.write(["rând 1\r\nrând 2\tși {acolade}", "\n", "😀 la final"]))
+        _outlines, written = drawing(self.path)
+        self.assertEqual(written, [("TEXT_IMOBILE", "rând 1 rând 2 și (acolade)"),
+                                   ("TEXT_IMOBILE", "? la final")])
+
+    def test_a_canceled_drawing_leaves_no_file(self):
+        self.assertFalse(self.write(stop=lambda: True))
+        self.assertEqual(os.listdir(self.tmp), [])
+
+    def test_a_drawing_that_cannot_be_created_raises_the_reason_with_its_path(self):
+        from cadex.services import dxf_writer
+        missing = os.path.join(self.tmp, "nu_exista", "desen.dxf")
+        with self.assertRaises(FileNotFoundError) as raised:
+            dxf_writer.write(missing, [])
+        self.assertEqual(raised.exception.filename, missing)
+
+    def test_two_kinds_with_one_layer_name_share_the_layer(self):
+        from cadex.services import dxf_writer
+        records = [{"rings": [[self.SQUARE]]}]
+        self.assertTrue(dxf_writer.write(self.path, [
+            ("CLADIRI", (6, "#FF00FF"), records, lambda r: ["ID 1"]),
+            ("CLADIRI", (4, "#00B8E6"), [{"rings": [[self.HOLE]]}], lambda r: ["C1"])]))
+        with open(self.path, encoding="latin-1") as fp:
+            lines = [line.strip() for line in fp]
+        # one definition of each layer in the drawing's layer table
+        table = lines[lines.index("AcDbLayerTableRecord"):lines.index("ENTITIES")]
+        self.assertEqual((table.count("CLADIRI"), table.count("TEXT_CLADIRI")), (1, 1))
+        outlines, texts = drawing(self.path)
+        self.assertEqual([layer for layer, _points, _color in outlines], ["CLADIRI", "CLADIRI"])
+        self.assertEqual(texts, [("TEXT_CLADIRI", "ID 1"), ("TEXT_CLADIRI", "C1")])
+
+    def test_the_drawing_is_written_by_a_gdal_that_reports_errors_as_return_values(self):
+        import warnings
+        from unittest import mock
+        from osgeo import gdal, ogr
+        # GDAL before 3.7 has no ExceptionMgr
+        with mock.patch.object(gdal, "ExceptionMgr", None), \
+                mock.patch.object(ogr, "ExceptionMgr", None), warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            self.assertTrue(self.write())
+            missing = os.path.join(self.tmp, "nu_exista", "desen.dxf")
+            from cadex.services import dxf_writer
+            with self.assertRaises(FileNotFoundError):
+                dxf_writer.write(missing, [])
+        outlines, texts = drawing(self.path)
+        self.assertEqual((len(outlines), texts), (3, [("TEXT_IMOBILE", "ID 501")]))
+
+    def test_when_gdal_cannot_find_its_dxf_header_file_the_outlines_keep_their_color(self):
+        from unittest import mock
+        from osgeo import gdal
+        with mock.patch.object(gdal, "FindFile", lambda *args: None):
+            self.assertTrue(self.write())
+        outlines, texts = drawing(self.path)
+        self.assertEqual([(layer, len(points)) for layer, points, _color in outlines],
+                         [("IMOBILE", 5), ("IMOBILE", 5), ("CONSTRUCTII", 5)])
+        self.assertEqual(outlines[0][2], "#ff00ff")
+        self.assertEqual(texts, [("TEXT_IMOBILE", "ID 501")])
+
+    def test_layer_names_in_other_alphabets_give_a_drawing_with_ascii_layer_names(self):
+        cgxml_export.write_dxf(
+            self.path, {"imobile": "Łąka", "constructii": "Кадастр"}, {},
+            [{"fisier": "1.cgxml", "rings": [[self.SQUARE]]}],
+            [{"fisier": "1.cgxml", "rings": [[self.HOLE]]}])
+        outlines, _texts = drawing(self.path)
+        layers = [layer for layer, _points, _color in outlines]
+        self.assertEqual(len(layers), 2)
+        self.assertTrue(all(layer.isascii() for layer in layers), layers)
+        self.assertNotEqual(layers[0], layers[1])
+
+
+class ColumnCatalogTests(unittest.TestCase):
+
+    def test_every_column_of_the_catalog_is_a_value_of_the_converted_records(self):
+        read = cgxml_export.read_all([helpers.DATA_DIR])
+        for which, records in (("imobile", read.imobile), ("constructii", read.constructii)):
+            self.assertTrue(records, which)
+            for record in records:
+                missing = [column.key for column in cgxml_columns.SPECS[which]
+                           if column.key not in record]
+                self.assertEqual(missing, [], (which, record["fisier"]))
 
 
 class HelperTests(unittest.TestCase):
@@ -267,6 +483,22 @@ class ConversionExportTests(ConversionTest):
         return cgxml_export.ConversionTask(
             input_paths=source, recursive=True, output_dir=self.out, base_name="rezultat",
             fmt=fmt, layouts=layout or layouts(), layer_names=NAMES, label_config=labels or {})
+
+    def test_a_text_longer_than_an_excel_cell_is_cut_and_counted(self):
+        owners = tuple(f"PROPRIETAR NUMARUL {n:05d}" for n in range(2000))
+        source = self.folder("multi", ("1.cgxml", synthetic.Land(
+            rings=[synthetic.square(500000, 400000, 20)], cadgenno="1", owners=owners)))
+        task = self.task("xlsx", source)
+        self.assertTrue(task.run(), task.error_msg)
+        self.assertEqual(task.cut_cells, 1)
+        _names, rows = xlsx.read_rows(task.outputs["file"], "Imobile")
+        owners_cell = rows[1][rows[0].index("Proprietari și posesori")]
+        self.assertEqual(len(owners_cell), xlsx.MAX_CELL_TEXT)
+
+    def test_a_table_whose_texts_fit_has_no_cut_cell(self):
+        task = self.task("xlsx", self.many("scurte", 3))
+        self.assertTrue(task.run(), task.error_msg)
+        self.assertEqual(task.cut_cells, 0)
 
     def many(self, name, count=30):
         return self.folder(name, *((f"{n}.cgxml", synthetic.Land(
@@ -378,7 +610,6 @@ class ConversionExportTests(ConversionTest):
                 self.assertEqual(QgsVectorLayer(previous, "", "ogr").featureCount(), 3)
                 self.assertFalse([n for n in os.listdir(self.out) if ".tmp" in n])
 
-    @unittest.skipUnless(__import__("importlib").util.find_spec("ezdxf"), "ezdxf missing")
     def test_dxf_writing_shows_progress_and_stops_when_canceled(self):
         source = self.many("mare")
         task = self.task("dxf", source)
@@ -428,6 +659,57 @@ class ConversionExportTests(ConversionTest):
                 x, y, _height, _rotation = dxf_writer.label_layout(["ID 1"], [ring])
                 self.assertGreater(dxf_writer._signed_distance(x, y, [ring]), 0)
 
+    def test_a_label_in_a_sliver_along_an_axis_is_placed_with_bounded_work(self):
+        from unittest import mock
+        from cadex.services import dxf_writer
+        # 100 m long, its third point 1 mm off the base: a hundred thousand times longer
+        # than wide
+        ring = [(500000.0, 400000.0), (500100.0, 400000.0), (500050.0, 400000.001)]
+        distance = dxf_writer._signed_distance
+        calls = []
+        with mock.patch.object(dxf_writer, "_signed_distance",
+                               lambda *args: calls.append(1) or distance(*args)):
+            x, y, _height, _rotation = dxf_writer.label_layout(["ID 10188"], [ring])
+        self.assertLessEqual(len(calls), 3000)
+        self.assertGreater(distance(x, y, [ring]), 0)
+
+
+class DxfLabelPlacementTests(unittest.TestCase):
+    """Labels in the DXF of a conversion, read back through GDAL."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="cadex_dxf_labels_")
+        self.addCleanup(helpers.remove_folder, self.tmp)
+
+    def labels(self, imobile, constructii):
+        """[(layer, text, x, y, height)] of the labels of a DXF written for the records."""
+        path = os.path.join(self.tmp, "etichete.dxf")
+        config = {"imobile": [{"key": "id", "on": True, "prefix": "ID ", "suffix": ""}],
+                  "constructii": [{"key": "nr_constr", "on": True}]}
+        cgxml_export.write_dxf(path, NAMES, config, imobile, constructii)
+        _outlines, texts = drawing(path, placed=True)
+        return texts
+
+    def test_the_label_of_an_imobil_is_placed_off_its_building(self):
+        x0, y0 = 500000.0, 400000.0
+        parcel = [(x0, y0), (x0 + 40, y0), (x0 + 40, y0 + 20), (x0, y0 + 20)]
+        house = [(x0 + 10, y0 + 5), (x0 + 30, y0 + 5), (x0 + 30, y0 + 15), (x0 + 10, y0 + 15)]
+        labels = self.labels([{"fisier": "1.cgxml", "id": 1, "rings": [[parcel]]}],
+                             [{"fisier": "1.cgxml", "nr_constr": "C1", "rings": [[house]]}])
+        [(x, y)] = [(x, y) for layer, text, x, y, _h in labels if text == "ID 1"]
+        self.assertFalse(x0 + 10 < x < x0 + 30 and y0 + 5 < y < y0 + 15, (x - x0, y - y0))
+        self.assertTrue(x0 < x < x0 + 40 and y0 < y < y0 + 20, (x - x0, y - y0))
+
+    def test_a_construction_label_is_smaller_than_an_imobil_label_in_the_same_space(self):
+        x0, y0 = 500000.0, 400000.0
+        big = [(x0, y0), (x0 + 100, y0), (x0 + 100, y0 + 100), (x0, y0 + 100)]
+        hall = [(x0 + 200, y0), (x0 + 300, y0), (x0 + 300, y0 + 100), (x0 + 200, y0 + 100)]
+        labels = self.labels([{"fisier": "1.cgxml", "id": 1, "rings": [[big]]}],
+                             [{"fisier": "2.cgxml", "nr_constr": "C1", "rings": [[hall]]}])
+        heights = {text: height for _layer, text, _x, _y, height in labels}
+        self.assertEqual(heights["ID 1"], 2.5)
+        self.assertEqual(heights["C1"], 1.5)
+
 
 class ConversionCountTests(ConversionTest):
     """What a conversion counts when a source cannot be read."""
@@ -437,8 +719,7 @@ class ConversionCountTests(ConversionTest):
         with open(damaged, "wb") as fp:
             fp.write(b"PK\x03\x04 o descarcare intrerupta")
         task = self.run_task("xlsx", source=[self.src, damaged], recursive=False)
-        _names, rows = xlsx.read_rows(task.outputs["file"], "Sumar")
-        facts = {row[0]: row[1] for row in rows if row and row[0]}
+        facts = helpers.summary_facts(task.outputs["file"])
         self.assertEqual((facts["Fișiere CGXML găsite"], facts["Fișiere necitite"]), (4, 1))
 
 
@@ -542,12 +823,9 @@ class ConversionRollbackTests(ConversionRerunTest):
         self.assertEqual(self.layer(task, "constructii").featureCount(), 2)
 
     def test_a_write_protected_file_of_the_previous_result_stops_the_rerun(self):
-        import importlib.util
         import stat
         # a spatial index another program made beside the Shapefile, and a drawing
-        cases = [("shp", "rezultat_imobile.qix")]
-        if importlib.util.find_spec("ezdxf"):
-            cases.append(("dxf", "rezultat.dxf"))
+        cases = [("shp", "rezultat_imobile.qix"), ("dxf", "rezultat.dxf")]
         with_buildings, _without = self.sources()
         for fmt_key, name in cases:
             with self.subTest(fmt=fmt_key):

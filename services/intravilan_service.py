@@ -13,7 +13,7 @@ from qgis.core import (  # type: ignore
     QgsGeometry, QgsSpatialIndex, QgsVectorFileWriter, QgsWkbTypes,
 )
 
-from . import fmt, stereo70, xlsx_report
+from . import fmt, overlay, stereo70, xlsx_report
 from .diminuare_service import distribute
 from .layer_sources import merged_fields, merged_value, unique_name
 from .roles import fold
@@ -38,6 +38,12 @@ STYLE_TABLE = "layer_styles"
 LOCK_WAIT = 1.0
 # how many partial imobile the Sumar ranks, at most, by extravilan area
 TOP_PARTIAL = 10
+# the most vertices of a piece of the merged contour: an imobil is cut against the few small
+# pieces it meets, not against a contour of tens of thousands of vertices
+PIECE_VERTICES = 256
+# metres: a strip thinner than this along an imobil's outline is what the overlay's grid and
+# the adding of areas leave, not ground; coordinates are given to the millimetre
+NOISE_WIDTH = 1e-5
 
 # (field, Excel header), appended after the imobil's own columns
 COMPUTED = (("sup_totala", "Suprafața totală (mp)"),
@@ -60,6 +66,15 @@ def classify(total, inside, tolerance):
     if inside <= tolerance:
         return INTEGRAL_EXTRA
     return PARTIAL
+
+
+def summed(rows) -> tuple:
+    """(total, in intravilan, in extravilan) of the rows of a report, in whole square metres:
+    the areas as measured added up and rounded once, the two parts adding up to the total."""
+    total = sum(row["area"] for row in rows)
+    inside = sum(row["inside"] for row in rows)
+    sup_intra, sup_extra = (int(v) for v in distribute([inside, total - inside], total, 0))
+    return sup_intra + sup_extra, sup_intra, sup_extra
 
 
 def polygonal(geometry) -> QgsGeometry:
@@ -173,6 +188,10 @@ class IntravilanTask(CadexTask):
         self.only_integral = only_integral
         self.rows = []
         self.skipped = 0
+        # whole square metres for all the rows, rounded once from the areas as measured
+        self.totals = {"sup_totala": 0, "sup_intra": 0, "sup_extra": 0}
+        # the cells of the Excel report whose text was cut to the length a cell holds
+        self.cut_cells = 0
         # the GeoPackage's features: offered, taken, and the first refusal's reason
         self.expected = 0
         self.written = 0
@@ -203,19 +222,31 @@ class IntravilanTask(CadexTask):
         except Exception as e:
             return self.failed("Raport Intravilan", e)
 
-    def _compute(self):
-        index = QgsSpatialIndex()
-        zones = {}
-        next_id = 0
+    def _contour_pieces(self):
+        """(pieces, their spatial index): the contour polygons of every layer merged into
+        one, so that ground two of them share counts once, then cut into pieces of at most
+        PIECE_VERTICES vertices. The pieces share no ground, so the area of an imobil in
+        intravilan is the sum of its intersections with them."""
+        zones = []
         for snapshot in self.intravilan:
             for _feature, geometry in snapshot.features():
                 geometry = polygonal(geometry)
-                if geometry.isEmpty():
-                    continue
-                zones[next_id] = geometry
-                index.addFeature(next_id, geometry.boundingBox())
-                next_id += 1
+                if not geometry.isEmpty():
+                    zones.append(geometry)
+        merged = overlay.union(zones)
+        pieces = []
+        if not merged.isNull() and not merged.isEmpty():
+            cut = merged.subdivide(PIECE_VERTICES)
+            # an uncut contour gives the same areas, more slowly
+            pieces = [piece for piece in (merged if cut.isNull() else cut).asGeometryCollection()
+                      if piece.type() == Qgis.GeometryType.Polygon and not piece.isEmpty()]
+        index = QgsSpatialIndex()
+        for number, piece in enumerate(pieces):
+            index.addFeature(number, piece.boundingBox())
+        return pieces, index
 
+    def _compute(self):
+        pieces, index = self._contour_pieces()
         total = sum(s.count for s in self.imobile) or 1
         done = 0
         self.fields = merged_fields(self.imobile)
@@ -235,17 +266,26 @@ class IntravilanTask(CadexTask):
                 if geometry.isEmpty() or area <= 0:
                     self.skipped += 1
                     continue
-                candidates = [zones[i] for i in index.intersects(geometry.boundingBox())]
                 inside = 0.0
-                if candidates:
-                    # merged first, so ground shared by two overlapping polygons counts once
-                    zone = (candidates[0] if len(candidates) == 1
-                            else QgsGeometry.unaryUnion(candidates))
-                    if geometry.intersects(zone):
-                        part = geometry.intersection(zone)
-                        if part is not None and not part.isEmpty():
-                            inside = min(part.area(), area)
+                for number in index.intersects(geometry.boundingBox()):
+                    part = overlay.intersection(geometry, pieces[number])
+                    if not part.isNull() and not part.isEmpty():
+                        inside += part.area()
+                inside = min(inside, area)
+                # the overlay can leave a sliver on the other side of the limit of an imobil
+                # that lies wholly on one side; up to the outline length times NOISE_WIDTH it
+                # counts as nothing, whatever the tolerance, 0 included
+                noise = geometry.length() * NOISE_WIDTH
+                if area - inside <= noise:
+                    inside = area
+                elif inside <= noise:
+                    inside = 0.0
                 status = classify(area, inside, self.tolerance)
+                # an imobil the tolerance places wholly on one side has its whole area there
+                if status == INTEGRAL_INTRA:
+                    inside = area
+                elif status == INTEGRAL_EXTRA:
+                    inside = 0.0
                 attributes = {name: feature[name] for name in snapshot.fields.names()}
                 # both parts rounded to whole square metres, still adding up to the rounded
                 # total
@@ -256,6 +296,9 @@ class IntravilanTask(CadexTask):
                     "fid": feature.id(),
                     "attrs": attributes,
                     "geometry": geometry,
+                    # as measured, for the totals
+                    "area": area,
+                    "inside": inside,
                     "sup_totala": sup_intra + sup_extra,
                     "sup_intra": sup_intra,
                     "sup_extra": sup_extra,
@@ -264,6 +307,7 @@ class IntravilanTask(CadexTask):
                     "owner": (merged_value(attributes, self.owner_field)
                               if self.owner_field else None),
                 })
+        self.totals = dict(zip(("sup_totala", "sup_intra", "sup_extra"), summed(self.rows)))
 
     def _output_fields(self):
         fields = QgsFields(self.fields)
@@ -376,6 +420,7 @@ class IntravilanTask(CadexTask):
                 sheet("Proprietari neidentificați", unknown)
         self._write_summary(wb)
         xlsx_report.save(wb, self.excel_path)
+        self.cut_cells = wb.cut_cells
 
     def _write_summary(self, wb):
         rows = self.rows
@@ -393,40 +438,43 @@ class IntravilanTask(CadexTask):
 
         n = len(rows) or 1
         counts = {s: [r for r in rows if r["situatie"] == s] for s in STATUSES}
+        # every total of the sheet is rounded once, from the areas as measured: adding up the
+        # rounded rows of 15,000 imobile gives tens of square metres more or less
+        total_area = self.totals["sup_totala"]
+        intra_area = self.totals["sup_intra"]
+        extra_area = self.totals["sup_extra"]
+        # the totals of the three statuses, adding up to the total of all the imobile
+        status_areas = [int(v) for v in distribute(
+            [sum(r["area"] for r in counts[s]) for s in STATUSES],
+            sum(r["area"] for r in rows), 0)]
         summary.section("Imobile")
         summary.table(
             ["Încadrare", "Nr. imobile", "Procent", "Suprafața totală (mp)"],
-            [["Toate imobilele", len(rows), xlsx_report.percent(100),
-              sum(r["sup_totala"] for r in rows)]]
-            + [[s, len(counts[s]), xlsx_report.percent(100.0 * len(counts[s]) / n),
-                sum(r["sup_totala"] for r in counts[s])] for s in STATUSES],
+            [["Toate imobilele", len(rows), xlsx_report.percent(100), total_area]]
+            + [[s, len(counts[s]), xlsx_report.percent(100.0 * len(counts[s]) / n), area]
+               for s, area in zip(STATUSES, status_areas)],
             row_colors=[None] + [STATUS_TINTS[s] for s in STATUSES])
 
-        total_area = sum(r["sup_totala"] for r in rows) or 1
-        intra_area = sum(r["sup_intra"] for r in rows)
-        extra_area = sum(r["sup_extra"] for r in rows)
         partial = counts[PARTIAL]
+        _partial_total, partial_intra, partial_extra = summed(partial)
 
         def pct(value):
-            return xlsx_report.percent(100.0 * value / total_area)
+            return xlsx_report.percent(100.0 * value / (total_area or 1))
 
         summary.section("Suprafețe")
         summary.table(
             ["Descriere", "Suprafață (mp)", "Procent", "Detalii"],
-            [["Suprafața tuturor imobilelor", total_area if rows else 0,
-              xlsx_report.percent(100), ""],
+            [["Suprafața tuturor imobilelor", total_area, xlsx_report.percent(100), ""],
              ["În intravilan", intra_area, pct(intra_area),
-              "Partea din intravilan a fiecărui imobil, inclusiv porțiunile care nu "
-              "schimbă încadrarea"],
+              "Imobilele integral în intravilan, cu toată suprafața lor, și partea din "
+              "intravilan a imobilelor parțiale"],
              ["În extravilan", extra_area, pct(extra_area),
-              "Partea din extravilan a fiecărui imobil, inclusiv porțiunile care nu "
-              "schimbă încadrarea"],
-             ["Partea din intravilan a imobilelor parțiale",
-              sum(r["sup_intra"] for r in partial),
-              pct(sum(r["sup_intra"] for r in partial)), ""],
-             ["Partea din extravilan a imobilelor parțiale",
-              sum(r["sup_extra"] for r in partial),
-              pct(sum(r["sup_extra"] for r in partial)), ""]],
+              "Imobilele integral în extravilan, cu toată suprafața lor, și partea din "
+              "extravilan a imobilelor parțiale"],
+             ["Partea din intravilan a imobilelor parțiale", partial_intra,
+              pct(partial_intra), ""],
+             ["Partea din extravilan a imobilelor parțiale", partial_extra,
+              pct(partial_extra), ""]],
             row_colors=[None, xlsx_report.GOOD, xlsx_report.BAD,
                         xlsx_report.MIXED, xlsx_report.MIXED])
 
@@ -437,8 +485,7 @@ class IntravilanTask(CadexTask):
                 members = [r for r in partial
                            if (low < r["pct_intra"] <= high)
                            or (low == 0 and r["pct_intra"] == 0)]
-                band_rows.append([f"{low}-{high}%", len(members),
-                                  sum(r["sup_extra"] for r in members), ""])
+                band_rows.append([f"{low}-{high}%", len(members), summed(members)[2], ""])
             summary.section("Imobile parțiale după procentul din intravilan")
             summary.table(["Procent în intravilan", "Nr. imobile",
                            "Suprafața în extravilan (mp)", ""], band_rows)
@@ -465,10 +512,12 @@ class IntravilanTask(CadexTask):
             summary.table(
                 ["Categorie", "Nr. imobile", "Suprafața totală (mp)",
                  "Din care în extravilan (mp)"],
-                [[label, len(states[key]), sum(r["sup_totala"] for r in states[key]),
-                  sum(r["sup_extra"] for r in states[key])]
+                [[label, len(states[key]), summed(states[key])[0], summed(states[key])[2]]
                  for key, label, _color in labels],
                 row_colors=[color for _key, _label, color in labels])
 
         summary.note("Suprafețele sunt calculate din geometrie, în planul Stereo 70 "
-                     "(EPSG:3844), și rotunjite la metru pătrat.")
+                     "(EPSG:3844), și rotunjite la metru pătrat. Un imobil încadrat integral "
+                     "are toată suprafața de partea încadrării lui. Totalurile sunt rotunjite "
+                     "o singură dată, din suprafețele măsurate, deci pot diferi cu câțiva "
+                     "metri pătrați de suma rândurilor.")

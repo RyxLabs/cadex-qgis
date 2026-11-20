@@ -57,7 +57,7 @@ class _TopologyBase(CadexAlgorithm):
                  tcs.MIN_AREA, 100.0),
                 ("SNAP_PRECISION", "Toleranță de racordare (m)", tcs.SNAP_PRECISION, 0.1),
                 ("SNAP_DISTANCE", "Distanță de racordare (m)", tcs.SNAP_DISTANCE, 5.0),
-                ("BUILDING_TOLERANCE", "Cât poate ieși un punct al construcției din imobil (m)",
+                ("BUILDING_TOLERANCE", "Cât poate ieși construcția din imobil (m)",
                  tcs.BUILDING_TOLERANCE, 1.0)):
             self.addParameter(advanced(QgsProcessingParameterNumber(
                 key, self.tr(label), NUMBER_DOUBLE, value, minValue=0.0, maxValue=top)))
@@ -182,13 +182,14 @@ class TopologyCheckAlgorithm(_TopologyBase):
                 "Sectorul drumurilor '{0}' nu se poate recunoaște fără 'Sector cadastral': "
                 "drumurile se verifică la fel ca celelalte imobile, iar suprapunerile cu ele se "
                 "raportează ca erori.").format(options["roads_sector"]))
+        # a model that goes on with the problem count would take 0 for a clean layer
         task = self.run_task(tcs.TopologyCheckTask(
             imobile=[imobile], constructii=[constructii] if constructii else [],
             id_field=id_field, sector_field=sector_field, link_field=link_field,
             number_field=number_field,
             facts=[(self.tr("Layer de imobile"), imobile.name),
                    (self.tr("Layer de construcții"), constructii.name if constructii else "-")],
-            **options), feedback)
+            stop_if_nothing_read=True, **options), feedback)
         return self.outputs(task, parameters, context, feedback)
 
 
@@ -231,8 +232,8 @@ class TopologyCheckCgxmlAlgorithm(_TopologyBase):
 class BuildingTopologyAlgorithm(CadexAlgorithm):
     NAME = "buildingtopology"
     TITLE = "Topologie Construcții"
-    SUMMARY = ("Taie construcțiile care depășesc limita imobilului lor și scrie un layer nou, "
-               "cu suprafața pierdută de fiecare construcție.")
+    SUMMARY = ("Taie construcțiile ieșite din imobilul lor și scrie un layer nou, cu suprafața "
+               "pierdută de fiecare construcție.")
     GROUP = "verificare"
     TOOL = "building_topology"
 
@@ -252,6 +253,9 @@ class BuildingTopologyAlgorithm(CadexAlgorithm):
             minValue=0.0, maxValue=1.0))
         self.addParameter(QgsProcessingParameterNumber(
             "THRESHOLD", self.tr("Prag de verificare (mp)"), NUMBER_DOUBLE, 1.0, minValue=0.0))
+        self.addParameter(advanced(QgsProcessingParameterNumber(
+            "TOLERANCE", self.tr("Cât poate ieși construcția din imobil (m)"),
+            NUMBER_DOUBLE, tcs.BUILDING_TOLERANCE, minValue=0.0, maxValue=1.0)))
         self.addParameter(QgsProcessingParameterField(
             "JOIN_FIELDS", self.tr("Coloane preluate din imobil"),
             parentLayerParameterName="IMOBILE", type=FIELD_ANY, allowMultiple=True,
@@ -282,6 +286,7 @@ class BuildingTopologyAlgorithm(CadexAlgorithm):
             imobile=[imobile], constructii=[constructii],
             buffer_m=self.parameterAsDouble(parameters, "BUFFER", context),
             threshold=self.parameterAsDouble(parameters, "THRESHOLD", context),
+            tolerance=self.parameterAsDouble(parameters, "TOLERANCE", context),
             join_fields=join_fields, link_field=link_field, key_field=key_field), feedback)
 
         fields, names, _join_names = bts.output_fields(constructii.fields, task.join_fields)

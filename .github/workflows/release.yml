@@ -1,0 +1,79 @@
+name: release
+
+# Runs for a pushed version tag only, never for a branch push or a pull request:
+#   git tag v0.3.0 && git push origin v0.3.0
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # the tag is the version of metadata.txt, and CHANGELOG.md has its dated section
+  notes:
+    name: tag and release notes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Write the release notes
+        run: python3 .github/scripts/release_notes.py "$GITHUB_REF_NAME" notes.md
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: notes.md
+          if-no-files-found: error
+
+  # the test jobs, the Windows job and the upload checks, on the tagged commit; its zip job
+  # builds cadex.<version>.zip with scripts/build_zip.py
+  tests:
+    needs: notes
+    uses: ./.github/workflows/tests.yml
+
+  publish:
+    name: GitHub release and plugins.qgis.org
+    needs: [notes, tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      PLUGINS_QGIS_ORG_TOKEN: ${{ secrets.PLUGINS_QGIS_ORG_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # the zip the jobs above tested and scanned
+      - uses: actions/download-artifact@v8
+        with:
+          name: cadex-release-zip
+          path: dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+          path: notes
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum dist/cadex.*.zip
+          gh release create "$GITHUB_REF_NAME" dist/cadex.*.zip \
+            --verify-tag --title "CADex ${GITHUB_REF_NAME#v}" --notes-file notes/notes.md
+
+      - name: Upload to plugins.qgis.org
+        if: env.PLUGINS_QGIS_ORG_TOKEN != ''
+        run: python3 .github/scripts/upload_plugin.py dist/cadex.*.zip
+
+      - name: No upload to plugins.qgis.org
+        if: env.PLUGINS_QGIS_ORG_TOKEN == ''
+        run: >-
+          echo "::notice::The repository has no PLUGINS_QGIS_ORG_TOKEN secret, so the zip of
+          the GitHub release was not uploaded to plugins.qgis.org."

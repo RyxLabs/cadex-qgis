@@ -12,9 +12,6 @@ dist/
 *.db
 !data/siruta.db
 
-# deps.py falls back to pip-installing into <plugin>/libs outside a QGIS profile
-libs/
-
 # Office lock files of an open report
 ~$*
 

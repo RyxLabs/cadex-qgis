@@ -8,10 +8,10 @@ import os
 import re
 import threading
 
-from qgis.PyQt.QtCore import QObject, QRectF, Qt, QTimer, pyqtSignal  # type: ignore
+from qgis.PyQt.QtCore import QEvent, QObject, QRectF, Qt, QTimer, pyqtSignal  # type: ignore
 from qgis.PyQt.QtGui import QPainter, QPalette, QTextOption  # type: ignore
 from qgis.PyQt.QtWidgets import (  # type: ignore
-    QButtonGroup, QCheckBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
+    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 from qgis.core import Qgis, QgsIconUtils, QgsProject, QgsVectorLayer  # type: ignore
@@ -164,6 +164,11 @@ class CheckList(QWidget):
     def _sync(self):
         """Bring the items up to date before they are read; LayerChecklist rebuilds here."""
 
+    def forget_choices(self):
+        """Drop the ticks set by the user, for a list that is refilled from another project:
+        the next refill ticks by its defaults."""
+        self._chosen = {}
+
     def _on_item_changed(self, item=None):
         # refills block the signals, so a change seen here is the user's
         if item is not None:
@@ -242,7 +247,8 @@ class LayerChecklist(CheckList):
     renamed, or given other fields or another source.
 
     Until the user changes a check state, the layers role_layers() gives for the role are
-    checked; after that, the user's choice is kept for the layers still in the project.
+    checked; after that, the user's choice is kept for the layers still in the project, until
+    the project is closed: the next project's layers are checked by role again.
 
     The list is rebuilt once for a burst of project changes, on the next pass of the event
     loop, and not at all while it is hidden or while QGIS reads a project: a hidden list is
@@ -272,7 +278,7 @@ class LayerChecklist(CheckList):
                 (project.layersRemoved, self._on_project_changed),
                 (project.layerLoaded, self._on_layer_loaded),
                 (project.readProject, self._on_loading_done),
-                (project.cleared, self._on_loading_done))
+                (project.cleared, self._on_cleared))
 
     def _layer_signals(self, layer):
         # Processing adds its outputs to the project before it marks them as reports
@@ -329,6 +335,15 @@ class LayerChecklist(CheckList):
 
     def _on_loading_done(self, *_args):
         self._loading = False
+        self._on_project_changed()
+
+    def _on_cleared(self, *_args):
+        self._loading = False
+        self.forget_choices()
+
+    def forget_choices(self):
+        super().forget_choices()
+        self._auto = True
         self._on_project_changed()
 
     def _on_property_changed(self, key):
@@ -430,27 +445,48 @@ def preselect_layer(combo, role_key, iface=None):
 
 
 def user_chose(combo) -> bool:
-    """True when the combo box's entry was picked by the user or restored from the
-    remembered values, rather than preselected by name."""
+    """True when the combo box's entry was picked by the user, in this window or at an
+    earlier run, rather than preselected by name."""
     return bool(combo.property(_ui_helpers.CHOSEN_PROPERTY))
+
+
+# set on the combo boxes fill_field_combo() has filled
+_FIELD_COMBO = "cadexChoicesNoted"
 
 
 def _note_choices(combo):
     # activated is emitted for the user's picks only, never for setCurrentIndex()
-    if combo.property("cadexChoicesNoted"):
+    if combo.property(_FIELD_COMBO):
         return
-    combo.setProperty("cadexChoicesNoted", True)
-    combo.activated.connect(
-        lambda _index, box=combo: box.setProperty(_ui_helpers.CHOSEN_PROPERTY, True))
+    combo.setProperty(_FIELD_COMBO, True)
+
+    def chosen(_index, box=combo):
+        box.setProperty(_ui_helpers.CHOSEN_PROPERTY, True)
+        box.setProperty(_ui_helpers.WANTED_PROPERTY, None)
+    combo.activated.connect(chosen)
+
+
+def forget_field_choices(root):
+    """Empty the field combo boxes under root and drop the user's choices in them, for a
+    window whose project was closed: the next fill_field_combo() selects by the name
+    patterns, not the column the previous project's layers had."""
+    for combo in root.findChildren(QComboBox):
+        if combo.property(_FIELD_COMBO):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.blockSignals(False)
+            combo.setProperty(_ui_helpers.CHOSEN_PROPERTY, False)
+            combo.setProperty(_ui_helpers.WANTED_PROPERTY, None)
 
 
 def fill_field_combo(combo, names, role_key=None, none_text=None, keep=None):
     """Fill a combo box with field names as item data.
 
-    none_text adds a first entry with empty data. keep stays selected while it is listed,
-    and so does the empty entry once the user picked it or it was restored from the
-    remembered values (user_chose). Otherwise the best match for the role's name patterns
-    is selected, and an earlier choice of the user no longer counts.
+    none_text adds a first entry with empty data. A column remembered as the user's choice
+    (_ui_helpers.choose_field) is selected once it is listed. Else keep stays selected while
+    it is listed, and so does the empty entry once the user picked it (user_chose). Otherwise
+    the best match for the role's name patterns is selected, and an earlier choice of the
+    user no longer counts.
     """
     _note_choices(combo)
     combo.blockSignals(True)
@@ -459,8 +495,13 @@ def fill_field_combo(combo, names, role_key=None, none_text=None, keep=None):
         combo.addItem(none_text, "")
     for name in names:
         combo.addItem(name, name)
-    if keep is not None and (keep in names or (keep == "" and none_text is not None
-                                               and user_chose(combo))):
+    wanted = combo.property(_ui_helpers.WANTED_PROPERTY)
+    if wanted is not None and (wanted in names or (wanted == "" and none_text is not None)):
+        combo.setProperty(_ui_helpers.WANTED_PROPERTY, None)
+        combo.setProperty(_ui_helpers.CHOSEN_PROPERTY, True)
+        target = wanted
+    elif keep is not None and (keep in names or (keep == "" and none_text is not None
+                                                 and user_chose(combo))):
         target = keep
     else:
         combo.setProperty(_ui_helpers.CHOSEN_PROPERTY, False)
@@ -590,6 +631,7 @@ class PathRow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         self.edit = PathEdit(self._accepts)
+        self.edit.setAccessibleName(title)
         self.edit.dropped.connect(lambda _path: self.picked.emit(self.path()))
         layout.addWidget(self.edit)
         button = QToolButton()
@@ -644,16 +686,17 @@ def _locate(paths):
 
 def _count_files(paths, recursive, located=None):
     """(number of .cgxml files or None, problem, paths concerned, the paths that are folders,
-    details for the log, files found) for a source; problem is None, "missing", "zip",
-    "in_use", "denied" or "unreadable". The number is None when part of the source is missing
-    or cannot be read; files found counts the .cgxml files in the parts that can be read.
-    located is _locate(paths) when the caller has it. Reads the file system, so it runs on a
-    worker thread."""
+    details for the log, files found, the unreadable parts with their reasons) for a source;
+    problem is None, "missing", "zip", "in_use", "denied" or "unreadable". The number is None
+    when part of the source is missing or cannot be read; files found counts the .cgxml files
+    in the parts that can be read, and the last text is cgxml_sources.unreadable_text() of
+    the others. located is _locate(paths) when the caller has it. Reads the file system, so
+    it runs on a worker thread."""
     if not paths:
-        return None, None, [], [], "", 0
+        return None, None, [], [], "", 0, ""
     missing, folders = located if located is not None else _locate(paths)
     if missing:
-        return None, "missing", missing, folders, "", 0
+        return None, "missing", missing, folders, "", 0, ""
     try:
         sources = cgxml_sources.list_sources(paths, recursive)
         unread = [s for s in sources if isinstance(s, cgxml_sources.Unreadable)]
@@ -670,14 +713,15 @@ def _count_files(paths, recursive, located=None):
             else:
                 kind = "unreadable"
             return (None, kind, [s[1] for s in unread], folders,
-                    "; ".join(f"{s[1]}: {s.error!r}" for s in unread), found)
-        return found, None, [], folders, "", found
+                    "; ".join(f"{s[1]}: {s.error!r}" for s in unread), found,
+                    cgxml_sources.unreadable_text(unread))
+        return found, None, [], folders, "", found, ""
     except PermissionError as error:
-        return None, "denied", [error.filename] if error.filename else [], folders, "", 0
+        return None, "denied", [error.filename] if error.filename else [], folders, "", 0, ""
     except Exception as error:
         named = getattr(error, "filename", None)
         return (None, "unreadable", [named] if named else [], folders, f"{paths}: {error!r}",
-                0)
+                0, "")
 
 
 class _Count:
@@ -703,7 +747,7 @@ class _Count:
             self.checked.set()
             self.result = _count_files(self.paths, self.recursive, self.located)
         except Exception as error:
-            self.result = (None, "unreadable", [], [], repr(error), 0)
+            self.result = (None, "unreadable", [], [], repr(error), 0, "")
         finally:
             self.checked.set()
             self.done.set()
@@ -783,6 +827,7 @@ class CgxmlSource(QWidget):
         row.setSpacing(4)
         self.edit = PathEdit(cgxml_sources.is_source, multiple=True)
         self.edit.setPlaceholderText(_tr("Folderul, arhiva ZIP sau fișierele .cgxml"))
+        self.edit.setAccessibleName(self.edit.placeholderText())
         self.edit.setToolTip(_tr("Scrieți calea, alegeți-o cu butoanele alăturate sau "
                                  "trageți aici un folder, o arhivă ZIP ori fișiere .cgxml. "
                                  "Mai multe căi se scriu între ghilimele."))
@@ -811,8 +856,6 @@ class CgxmlSource(QWidget):
         self.status = StatusLabel()
         line.addWidget(self.status, 1)
         layout.addLayout(line)
-        self._count = None
-        self._found = 0
         # the count in progress or the last one shown
         self._job = None
         # refresh() was called while the field was hidden
@@ -872,34 +915,37 @@ class CgxmlSource(QWidget):
     def set_paths(self, paths):
         self.edit.setText(cgxml_sources.join_paths(paths))
 
-    def count(self):
-        """The .cgxml files found, None for a missing or unreadable source. Waits for a count
-        in progress, and counts at once when the field was hidden at the last refresh()."""
-        self._wait()
-        return self._count
-
-    def found(self):
-        """The .cgxml files found in the parts of the source that can be read, 0 for a
-        missing source. Waits like count()."""
-        self._wait()
-        return self._found
-
-    def _wait(self):
-        if self._waiting:
-            self._start_count()
+    def counted(self) -> bool:
+        """True when the files of the field's present text have been counted. When they have
+        not, their count is in progress or starts now, also for a hidden field. Never
+        waits."""
         job = self._job
-        if job is not None and not job.applied:
-            job.done.wait()
+        if self._waiting or job is None or (job.text, job.recursive) != (
+                self.edit.text(), self.recursive.isChecked()):
+            self._start_count()
+            job = self._job
+        elif not job.applied and job.done.is_set():
             self._apply(job)
+        return job.applied
+
+    def outcome(self):
+        """(found, problem, unreadable) of the last finished count, without waiting for one
+        in progress: found counts the .cgxml files in the parts that can be read; problem is
+        None, "missing", "zip", "in_use", "denied" or "unreadable"; unreadable names the parts
+        that cannot be read, with their reasons. (0, None, "") before a count has ended."""
+        job = self._job
+        if job is None or not job.applied:
+            return 0, None, ""
+        _count, problem, _names, _folders, _details, found, unreadable = job.result
+        return found, problem, unreadable
 
     def missing(self):
         """The paths in the field that the last count did not find; None while the files are
-        being counted, before the first count, or when the text has changed since. Unlike
-        count(), it never waits."""
+        being counted, before the first count, or when the text has changed since."""
         job = self._job
         if job is None or not job.applied or job.text != self.edit.text():
             return None
-        _count, problem, names, _folders, _details, _found = job.result
+        _count, problem, names = job.result[:3]
         return list(names) if problem == "missing" else []
 
     def refresh(self):
@@ -913,8 +959,6 @@ class CgxmlSource(QWidget):
         else:
             self._waiting = True
             self._job = None
-            self._count = None
-            self._found = 0
         self.changed.emit()
 
     def _on_edited(self):
@@ -942,8 +986,6 @@ class CgxmlSource(QWidget):
         self._waiting = False
         job = _Count(self.edit.text(), self.recursive.isChecked())
         self._job = job
-        self._count = None
-        self._found = 0
         if not job.paths:
             job.run()
             self._apply(job)
@@ -962,9 +1004,7 @@ class CgxmlSource(QWidget):
 
     def _apply(self, job):
         job.applied = True
-        count, problem, names, folders, details, found = job.result
-        self._count = count
-        self._found = found
+        count, problem, names, folders, details = job.result[:5]
         # archives and single files have no subfolders
         self.recursive.setEnabled(not job.paths or bool(folders))
         if details:
@@ -1121,7 +1161,8 @@ class StatusLabel(QWidget):
         self._label.setText(text)
         icon = self.ICONS.get(level)
         if icon:
-            self._icon.setPixmap(_ui_helpers.theme_icon(icon).pixmap(16, 16))
+            self._icon.setPixmap(
+                _ui_helpers.icon_pixmap(_ui_helpers.theme_icon(icon), 16))
         else:
             self._icon.clear()
         self.setVisible(bool(text))
@@ -1130,10 +1171,31 @@ class StatusLabel(QWidget):
         return self._label.text()
 
 
+class LinkedText(QLabel):
+    """Wrapping rich text whose links open in the browser and take the theme's link color,
+    also when the palette changes while the label exists."""
+
+    def __init__(self, html_text: str, parent=None):
+        super().__init__(parent)
+        self._html = html_text
+        self.setOpenExternalLinks(True)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.setWordWrap(True)
+        self._color_links()
+
+    def _color_links(self):
+        self.setText(theme.colored_links(self._html))
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange:
+            self._color_links()
+
+
 def link_text_html(text: str, url: str, link_text: str) -> str:
     # word joiners keep the link text on one line; Qt rich text ignores <nobr> in wrapping labels
     shown = html.escape(link_text).replace("/", "/" + WORD_JOINER)
-    return theme.colored_links(f"{html.escape(text)} <a href='{url}'>{shown}</a>")
+    return f"{html.escape(text)} <a href='{url}'>{shown}</a>"
 
 
 def link_label(text: str, url: str, link_text: str) -> QWidget:
@@ -1144,13 +1206,9 @@ def link_label(text: str, url: str, link_text: str) -> QWidget:
     layout.setContentsMargins(10, 7, 10, 7)
     layout.setSpacing(8)
     icon = QLabel()
-    icon.setPixmap(_ui_helpers.plugin_icon("cadex.svg").pixmap(18, 18))
+    icon.setPixmap(_ui_helpers.icon_pixmap(_ui_helpers.plugin_icon("cadex.svg"), 18))
     layout.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
-    label = QLabel(link_text_html(text, url, link_text))
-    label.setOpenExternalLinks(True)
-    label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-    label.setWordWrap(True)
-    layout.addWidget(label, 1)
+    layout.addWidget(LinkedText(link_text_html(text, url, link_text)), 1)
     return card
 
 

@@ -3,8 +3,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Verificare Topologică window: project layers or CGXML files."""
 
-import os
-
 from qgis.PyQt.QtWidgets import (  # type: ignore
     QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QVBoxLayout, QWidget,
 )
@@ -15,10 +13,10 @@ from . import _ui_helpers
 from .base_dialog import BaseDialog
 from .widgets import (
     CgxmlSource, LayerChecklist, PageStack, PathRow, SegmentedControl, converted_column,
-    data_field_names, fill_field_combo, hint_label, make_form, preselect_layer,
+    data_field_names, fill_field_combo, hint_label, make_form, preselect_layer, user_chose,
 )
 from .. import features
-from ..services import cgxml_sources, fmt, layer_style, stereo70
+from ..services import fmt, layer_style, stereo70
 from ..services import topology_check_service as tcs
 from ..services.layer_sources import LayerSnapshot
 
@@ -79,8 +77,9 @@ class TopologyCheckDialog(BaseDialog):
         tol_form.addRow(self.tr("Distanță de racordare:"), self.snap_distance)
         self.building_tolerance = self._spin(
             0.0, 1.0, 3, 0.005, tcs.BUILDING_TOLERANCE, " m", self.tr(
-                "Cât poate ieși un punct al construcției din imobilul ei fără să fie "
-                "raportat."))
+                "Construcția se raportează când un punct al ei iese din imobil cu mai mult de "
+                "această valoare sau când o parte a ei mai lată decât această valoare stă în "
+                "afara imobilului."))
         tol_form.addRow(self.tr("Ieșire construcții:"), self.building_tolerance)
         self.roads_sector = QLineEdit(tcs.ROADS)
         self.roads_sector.setMaximumWidth(self.building_tolerance.sizeHint().width())
@@ -114,8 +113,9 @@ class TopologyCheckDialog(BaseDialog):
         limits_layout = QVBoxLayout(self.limits_group)
         limits_layout.addWidget(hint_label(self.tr(
             "Cu limitele sectoarelor se găsesc și terenul neacoperit de la marginea sectorului "
-            "și imobilele care ies din el. Fără ele se verifică golurile închise "
-            "între imobile.")))
+            "și imobilele care ies din el. Fără ele se găsesc golurile închise între imobile: "
+            "cele dintr-un sector sunt erori, iar cele închise între imobile din sectoare "
+            "diferite sunt avertismente.")))
         limits_form = make_form()
         self.limit_combo = QgsMapLayerComboBox()
         self.limit_combo.setFilters(QgsMapLayerProxyModel.Filter.PolygonLayer)
@@ -151,7 +151,7 @@ class TopologyCheckDialog(BaseDialog):
 
         self.source_mode.changed.connect(self._on_source_changed)
         self.remember("source_mode", self.source_mode)
-        self.remember("cgxml", self.cgxml.edit)
+        self.remember("cgxml", self.cgxml.edit, per_project=True)
         self.remember("recursive", self.cgxml.recursive)
         self.remember("min_area", self.min_area)
         self.remember("snap_precision", self.snap_precision)
@@ -159,16 +159,14 @@ class TopologyCheckDialog(BaseDialog):
         self.remember("building_tolerance", self.building_tolerance)
         self.remember("roads_sector", self.roads_sector)
         self.remember("limits", self.limits_group)
-        self.remember("excel", self.excel_row.edit)
+        self.remember("excel", self.excel_row.edit, per_project=True)
         self._refresh_imobile_fields()
         self._refresh_link_fields()
         self._refresh_limit_fields()
-        self.remember("id_field", self.id_combo, by_text=True)
-        self.remember("sector_field", self.sector_combo, by_text=True)
-        self.remember("link_field", self.link_combo, by_text=True)
+        self.remember("id_field", self.id_combo, column=True)
+        self.remember("sector_field", self.sector_combo, column=True)
+        self.remember("link_field", self.link_combo, column=True)
         self.restore_remembered()
-        # a remembered "(după suprapunere)" may be the untouched default of an earlier run
-        self._refresh_link_fields()
         self.link_combo.activated.connect(self._on_link_chosen)
         self.limits_group.setCollapsed(not self.limits_group.isChecked())
         self._show_tolerance_state()
@@ -204,9 +202,10 @@ class TopologyCheckDialog(BaseDialog):
         fields_form.addRow(self.tr("ID imobil:"), self.id_combo)
         self.sector_combo = QComboBox()
         self.sector_combo.setToolTip(self.tr(
-            "Golurile se caută în fiecare sector, iar limitele sectoarelor se potrivesc după "
-            "această coloană. Sectorul drumurilor, ales la Toleranțe, nu se verifică la goluri "
-            "și racordare."))
+            "Un gol închis între imobilele unui sector este eroare, iar unul închis între "
+            "imobile din sectoare diferite este avertisment. Limitele sectoarelor se potrivesc "
+            "după această coloană. Sectorul drumurilor, ales la Toleranțe, nu se verifică la "
+            "goluri și racordare."))
         fields_form.addRow(self.tr("Sector cadastral:"), self.sector_combo)
         self.link_combo = QComboBox()
         self.link_combo.setToolTip(self.tr(
@@ -278,7 +277,8 @@ class TopologyCheckDialog(BaseDialog):
         # holds the imobil
         layers = self.constructii.checked_layers()
         keep = self.link_combo.currentData()
-        if not keep and not self._link_chosen:
+        # "(după suprapunere)" picked by hand, in this window or at an earlier run, stays
+        if not keep and not self._link_chosen and not user_chose(self.link_combo):
             keep = converted_column(layers, "id")
         fill_field_combo(self.link_combo, data_field_names(layers), None,
                          self.tr("(după suprapunere)"), keep)
@@ -337,26 +337,11 @@ class TopologyCheckDialog(BaseDialog):
         self.start_task(task, self.tr("Se verifică topologia..."))
 
     def _cgxml_task(self, limits, common):
-        paths = self.cgxml.paths()
-        if not paths or not all(os.path.exists(p) for p in paths):
-            self.warn(self.tr("Alegeți folderul, arhiva ZIP sau fișierele CGXML."),
-                      self.cgxml.edit)
-            return None
-        try:
-            sources = cgxml_sources.list_sources(paths, self.cgxml.recursive.isChecked())
-        except Exception as e:
-            self.warn(self.tr("Sursa nu poate fi citită: {0}").format(e), self.cgxml.edit)
-            return None
-        if not sources:
-            self.warn(self.tr("Nu s-a găsit niciun fișier .cgxml în sursa aleasă."),
-                      self.cgxml.edit)
-            return None
-        if all(isinstance(s, cgxml_sources.Unreadable) for s in sources):
-            self.warn(self.tr("Sursa aleasă nu poate fi citită: {0}.").format(
-                cgxml_sources.unreadable_text(sources)), self.cgxml.edit)
+        if not self.sources_ready([(self.cgxml, "")], self._run):
             return None
         if limits and not self.check_crs([limits]):
             return None
+        paths = self.cgxml.paths()
         return tcs.TopologyCheckTask(
             cgxml_paths=paths, recursive=self.cgxml.recursive.isChecked(),
             limits=LayerSnapshot(limits) if limits else None,
@@ -500,3 +485,12 @@ class TopologyCheckDialog(BaseDialog):
                           "fișier s-a verificat ca imobil separat.")
                   .format(imobil, ", ".join(files)) for imobil, files in task.reused_keys]
         return "\n".join(lines) or None
+
+    def project_changed(self):
+        super().project_changed()
+        self._link_chosen = False
+        # as __init__ does: preselect the limits layer by name and refill the sector column
+        # box, which super() emptied; the imobile and construcții column boxes refill with
+        # their layer lists
+        preselect_layer(self.limit_combo, "roles/sectoare")
+        self._refresh_limit_fields()

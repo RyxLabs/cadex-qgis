@@ -19,7 +19,9 @@ from .widgets import (
     fill_field_combo, make_form,
 )
 from .. import features
-from ..services import fmt, intravilan_service, layer_style, outputs, roles, stereo70
+from ..services import (
+    fmt, intravilan_service, layer_style, outputs, roles, stereo70, xlsx_report,
+)
 from ..services.layer_sources import LayerSnapshot
 
 
@@ -122,8 +124,8 @@ class IntravilanDialog(BaseDialog):
         self.remember("tolerance", self.tolerance)
         self.remember("only_integral", self.only_integral)
         self.remember("add_to_project", self.add_to_project)
-        self.remember("gpkg", self.gpkg_row.edit)
-        self.remember("excel", self.excel_row.edit)
+        self.remember("gpkg", self.gpkg_row.edit, per_project=True)
+        self.remember("excel", self.excel_row.edit, per_project=True)
         self.restore_remembered()
         self._refresh_fields()
 
@@ -230,15 +232,15 @@ class IntravilanDialog(BaseDialog):
         table = intravilan_service.TABLE
         if excel and os.path.exists(excel):
             question = self.tr(
-                "Fișierele {0} și {1} există deja. Raportul Excel se înlocuiește, iar în {1} "
-                "raportul se scrie ca layerul '{2}', în locul celui cu același nume, dacă "
-                "există; celelalte layere din fișier rămân neschimbate. Continuați?").format(
-                    os.path.basename(excel), os.path.basename(gpkg), table)
+                "Fișierele '{0}' și '{1}' există deja. Raportul Excel se înlocuiește, iar în "
+                "GeoPackage raportul se scrie ca layerul '{2}', în locul celui cu același nume, "
+                "dacă există; celelalte layere din fișier rămân neschimbate. Continuați?"
+            ).format(os.path.normpath(excel), os.path.normpath(gpkg), table)
         else:
             question = self.tr(
-                "Fișierul {0} există deja. Raportul se scrie în el ca layerul '{1}', în locul "
-                "celui cu același nume, dacă există; celelalte layere din fișier rămân "
-                "neschimbate. Continuați?").format(os.path.basename(gpkg), table)
+                "Fișierul '{0}' există deja. Raportul se scrie în el ca layerul '{1}', în "
+                "locul celui cu același nume, dacă există; celelalte layere din fișier rămân "
+                "neschimbate. Continuați?").format(os.path.normpath(gpkg), table)
         return self.confirm(self.tr("Suprascriere"), question, self.tr("Continuă"),
                             self.tr("Anulează"))
 
@@ -390,10 +392,13 @@ class IntravilanDialog(BaseDialog):
         if shortfall:
             notes.append(shortfall)
         reports = self.report_notes(task)
+        if task.cut_cells:
+            reports.append(xlsx_report.cut_note(task.cut_cells))
         notes += reports
         layers = []
         if layer is not None and self.add_to_project.isChecked():
             layers = _ui_helpers.add_layers([layer])
+        if layers:
             notes.append(self.tr("Layer adăugat în proiect: {0}.").format(layer.name())
                          + ("" if task.gpkg_path else " " + self.tr(
                              "Este temporar; salvați-l dacă doriți să-l păstrați.")))
@@ -405,9 +410,9 @@ class IntravilanDialog(BaseDialog):
                   for s in intravilan_service.STATUSES]
         counts += [None,
                    (self.tr("Suprafață în intravilan"),
-                    fmt.area(sum(r["sup_intra"] for r in rows), 0), None),
+                    fmt.area(task.totals["sup_intra"], 0), None),
                    (self.tr("Suprafață în extravilan"),
-                    fmt.area(sum(r["sup_extra"] for r in rows), 0), None)]
+                    fmt.area(task.totals["sup_extra"], 0), None)]
         # a report that was not written is not offered for opening
         excel = task.excel_path if not task.report_error else None
         self.show_result(
@@ -416,3 +421,8 @@ class IntravilanDialog(BaseDialog):
                 fmt.count(len(rows), self.tr("imobil"), self.tr("imobile"))),
             counts=counts, notes=notes, file_path=excel or task.gpkg_path,
             warning=bool(shortfall or reports), layers=layers)
+
+    def project_changed(self):
+        super().project_changed()
+        # the layers taken out for a run belong to the project that was closed
+        self._released = []

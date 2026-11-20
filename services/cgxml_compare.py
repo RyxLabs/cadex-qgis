@@ -15,26 +15,39 @@ column and boundary, their construcții by number.
 # - IE and CADGENNO are unique per UAT only, so with several UATs on either side a key pairs
 #   within its own UAT
 # - a key repeated on one side keeps the first file by name; the others are listed as ignored
-# - by IE, the eTerra export may be either source: the comparison runs with it as the old
+# - a source is an eTerra export when most of its imobile have no cadastral sector
+#   (is_eterra_side). What follows about an export applies when exactly one of the two
+#   sources, on either side, is an export: the comparison runs with the export as the old
 #   source and its outcomes are turned back to the order chosen (_turn_around)
-# - by IE, a delivery imobil without an IE exists only in the delivery
-# - by IE, an IE repeated in the delivery is an eTerra imobil split by the systematic work:
-#   the eTerra imobil is compared with all its pieces together
-# - by IE, an eTerra export fills other columns than a delivery and leaves some imobile and
-#   construcții without coordinates; a value only one side has is no change, and eTerra
-#   writes 0 for an area or a number of levels it does not have
+# - by IE with an export, a delivery imobil without an IE exists only in the delivery, and an
+#   IE repeated in the delivery is an eTerra imobil split by the systematic work: the eTerra
+#   imobil is compared with all its pieces together
+# - by name with an export, whose files are named by IE while a delivery's are named by
+#   cadastral number, two files are the same imobil only when they hold the same IE
+# - by IE when neither source or both are eTerra exports, an IE held by exactly one file on
+#   each side pairs those two files; the files left pair by CADGENNO, then by name
+#   (pair_by_ie)
+# - an eTerra export fills other columns than a delivery and leaves some imobile and
+#   construcții without coordinates; against a delivery, in either pairing mode, a value
+#   only one side has is no change, and eTerra writes 0 for an area or a number of levels
+#   it does not have
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, NamedTuple, Optional
 
-from qgis.core import Qgis, QgsFeature, QgsField, QgsGeometry  # type: ignore
+from qgis.core import Qgis, QgsFeature, QgsField  # type: ignore
 
-from . import cgxml_columns, cgxml_export, cgxml_sources, fmt, roles, siruta, stereo70, xlsx_report
+from . import (
+    cgxml_columns, cgxml_export, cgxml_sources, fmt, overlay, roles, siruta, stereo70,
+    xlsx_report,
+)
 from .compare_service import (
-    CHANGE_KIND_FIELD, GEOMETRY, ResultFeatures, change_kind, comparable, geometry_change,
-    kind_rows, normalize_key, normalized_differ, values_differ,
+    CHANGE_KIND_FIELD, CODE_COLUMNS, GEOMETRY, LIST_COLUMNS, MEASURED_AREA, ResultFeatures,
+    change_kind, comparable, counted, geometry_change, is_number, kind_rows, normalize_key,
+    normalized_differ, values_differ,
 )
 from .layer_sources import LayerInfo, unique_name
 from .tasks import CadexTask
@@ -51,7 +64,8 @@ MODE_HINTS = {
               "dispărut și apărut.",
     IE: "Fișierele se potrivesc după IE, oricum s-ar numi. Când una dintre surse este un export "
         "eTerra, un imobil din eTerra dezmembrat se compară cu toate imobilele din cealaltă "
-        "sursă care îi păstrează IE-ul, iar imobilele fără IE apar doar în sursa lor.",
+        "sursă care îi păstrează IE-ul, iar imobilele fără IE apar doar în sursa lor. Altfel, "
+        "un fișier fără pereche după IE se caută apoi după numărul cadastral și după nume.",
 }
 
 OLD_SIDE = "Sursa veche"
@@ -264,6 +278,20 @@ def _scoped_key(scoped, uat, key):
     return f"{uat}|{key.upper()}" if scoped else key.upper()
 
 
+def _settle_uats(entries) -> list:
+    """count_uats() of a side; a file without SIRSUP takes the side's UAT when there is only
+    one."""
+    uats = count_uats(entries)
+    if len(uats) == 1:
+        for entry in entries:
+            entry.uat = entry.uat or uats[0][0]
+    return uats
+
+
+def _by_file_name(entries) -> list:
+    return sorted(entries, key=lambda e: e.file_name.upper())
+
+
 def index_source(entries, mode, side, delivery=None) -> SourceIndex:
     """Index one side's files by key, in file name order, so a repeated key keeps its first
     file. A file without SIRSUP takes the side's UAT when there is only one. side names the
@@ -271,13 +299,10 @@ def index_source(entries, mode, side, delivery=None) -> SourceIndex:
     without an IE is a new imobil and a repeated IE a piece of a split imobil."""
     if delivery is None:
         delivery = side == NEW_SIDE
-    uats = count_uats(entries)
-    only = uats[0][0] if len(uats) == 1 else ""
+    uats = _settle_uats(entries)
     scoped = len(uats) > 1
     by_key, unkeyed, ignored = {}, [], []
-    for entry in sorted(entries, key=lambda e: e.file_name.upper()):
-        if not entry.uat and only:
-            entry.uat = only
+    for entry in _by_file_name(entries):
         key = key_of(entry, mode)
         if not key:
             if mode == IE and delivery:
@@ -307,32 +332,26 @@ def _by_cadgenno(entry):
     return entry.cadgenno or None
 
 
-def pair_sources(older: SourceIndex, newer: SourceIndex):
-    """(pairs, missing), missing being [(ONLY_OLD or ONLY_NEW, match text, entry)]."""
-    scoped = bool(older.uats) and bool(newer.uats) and (len(older.uats) > 1 or len(newer.uats) > 1)
+def _by_stem(entry):
+    return stem_of(entry.file_name).strip() or None
 
-    def lookup(entry, key):
-        return _scoped_key(scoped, entry.uat, key)
 
+def _same_ie(first: Entry, second: Entry) -> bool:
+    return bool(first.ie) and first.ie.upper() == second.ie.upper()
+
+
+def _scoped(old_uats, new_uats) -> bool:
+    """Whether keys pair within their UAT: both sides name UATs and one names several."""
+    return bool(old_uats) and bool(new_uats) and (len(old_uats) > 1 or len(new_uats) > 1)
+
+
+def _pair_leftovers(leftover_old, leftover_new, passes, lookup, key_shown, accepted=None):
+    """([Pair], files of leftover_new still unpaired) after the passes, each a (matched_by,
+    key of an entry, whether only keys that one leftover file holds on each side count).
+    leftover_old, a dict used as an ordered set, loses the files paired. key_shown gives a
+    pair's key from its new file and its pass; accepted(old, new), when given, must return
+    True for old and new to pair."""
     pairs = []
-    old_by_key = {}
-    for entry in older.by_key.values():
-        old_by_key[lookup(entry, entry.key)] = entry
-    # dict as an ordered set; entries hash by identity
-    leftover_old = dict.fromkeys(older.by_key.values())
-    leftover_new = []
-    for entry in newer.by_key.values():
-        counterpart = old_by_key.get(lookup(entry, entry.key))
-        if counterpart is not None and counterpart in leftover_old:
-            pairs.append(Pair(entry.key, counterpart, entry, "key"))
-            del leftover_old[counterpart]
-        else:
-            leftover_new.append(entry)
-
-    # (matched_by, key of an entry, whether only keys that one leftover file holds on each
-    # side count)
-    passes = ([("cadgenno", _by_cadgenno, False), ("ie", _by_ie, True)]
-              if newer.mode == FILENAME else [])
     for matched_by, key_fn, single_only in passes:
         candidates = {}
         for entry in leftover_old:
@@ -350,25 +369,93 @@ def pair_sources(older: SourceIndex, newer: SourceIndex):
             found = candidates.get(lookup(entry, key), []) if key is not None else []
             if single_only and (len(found) != 1 or new_counts[lookup(entry, key)] != 1):
                 found = []
-            counterpart = found[0] if found else None
-            if counterpart is None or counterpart not in leftover_old:
+            counterpart = next((old for old in found if old in leftover_old
+                                and (accepted is None or accepted(old, entry))), None)
+            if counterpart is None:
                 still_new.append(entry)
                 continue
-            pairs.append(Pair(entry.key, counterpart, entry, matched_by))
+            pairs.append(Pair(key_shown(entry, matched_by), counterpart, entry, matched_by))
             del leftover_old[counterpart]
         leftover_new = still_new
+    return pairs, leftover_new
+
+
+def pair_sources(older: SourceIndex, newer: SourceIndex, export=False):
+    """(pairs, missing), missing being [(ONLY_OLD or ONLY_NEW, match text, entry)]. export:
+    older is an eTerra export and newer a delivery, whose files, paired by name or by
+    cadastral number, are the same imobil only when they hold the same IE."""
+    scoped = _scoped(older.uats, newer.uats)
+    accepted = _same_ie if export and newer.mode == FILENAME else None
+
+    def lookup(entry, key):
+        return _scoped_key(scoped, entry.uat, key)
+
+    pairs = []
+    old_by_key = {}
+    for entry in older.by_key.values():
+        old_by_key[lookup(entry, entry.key)] = entry
+    # dict as an ordered set; entries hash by identity
+    leftover_old = dict.fromkeys(older.by_key.values())
+    leftover_new = []
+    for entry in newer.by_key.values():
+        counterpart = old_by_key.get(lookup(entry, entry.key))
+        if (counterpart is not None and counterpart in leftover_old
+                and (accepted is None or accepted(counterpart, entry))):
+            pairs.append(Pair(entry.key, counterpart, entry, "key"))
+            del leftover_old[counterpart]
+        else:
+            leftover_new.append(entry)
+
+    passes = ([("cadgenno", _by_cadgenno, False), ("ie", _by_ie, True)]
+              if newer.mode == FILENAME else [])
+    renamed, leftover_new = _pair_leftovers(
+        leftover_old, leftover_new, passes, lookup, lambda entry, _matched_by: entry.key,
+        accepted)
+    pairs += renamed
 
     missing = [(ONLY_OLD, match_text(older.mode, e.key), e) for e in leftover_old]
     missing += [(ONLY_NEW, match_text(newer.mode, e.key), e) for e in leftover_new]
-    missing += [(ONLY_NEW, "fără IE (imobil nou)" if e.is_new else "fără IE", e)
-                for e in newer.unkeyed]
+    missing += [(ONLY_NEW, _without_ie_text(e), e) for e in newer.unkeyed]
+    return pairs, missing
+
+
+def _without_ie_text(entry) -> str:
+    return "fără IE (imobil nou)" if entry.is_new else "fără IE"
+
+
+def _owner_text(entry) -> str:
+    """An imobil named apart from the IEs: "ID 9001", else its file name."""
+    return f"ID {entry.cadgenno}" if entry.cadgenno else stem_of(entry.file_name)
+
+
+def pair_by_ie(old_entries, new_entries):
+    """(pairs, missing) as pair_sources() gives them, for two sources matched by IE when
+    neither or both are eTerra exports. An IE held by exactly one file on each side pairs
+    those two files. The files left, among them those without an IE and those sharing one,
+    pair by cadastral number, then by file name, so every file of a source compared with itself
+    finds its own."""
+    scoped = _scoped(_settle_uats(old_entries), _settle_uats(new_entries))
+    for entry in old_entries + new_entries:
+        entry.key = entry.ie
+    leftover_old = dict.fromkeys(_by_file_name(old_entries))
+    passes = [("key", _by_ie, True), ("cadgenno", _by_cadgenno, False),
+              ("filename", _by_stem, False)]
+    pairs, leftover_new = _pair_leftovers(
+        leftover_old, _by_file_name(new_entries), passes,
+        lambda entry, key: _scoped_key(scoped, entry.uat, key),
+        lambda entry, matched_by: entry.ie if matched_by == "key" else _owner_text(entry))
+    missing = [(state, match_text(IE, e.ie) if e.ie else _without_ie_text(e), e)
+               for state, left in ((ONLY_OLD, leftover_old), (ONLY_NEW, leftover_new))
+               for e in left]
     return pairs, missing
 
 
 def is_eterra_side(entries) -> bool:
     """Whether a source's files are an eTerra export: every imobil of a delivery has its
-    cadastral sector, those of an eTerra export none."""
-    return bool(entries) and all(e.record.get("sector") is None for e in entries)
+    cadastral sector, those of an eTerra export none. A source is what most of its files
+    are, so a stray file of the other kind does not change it."""
+    without_sector = sum(1 for e in entries if e.record.get("sector") is None)
+    return 2 * without_sector > len(entries)
 
 
 # --- comparing ---
@@ -453,6 +540,19 @@ def whole_metres(a: float, b: float) -> bool:
     return abs(a - b) <= 0.5 and (a.is_integer() or b.is_integer())
 
 
+def _difference(column, before, after):
+    """CHANGED, ONE_SIDED, ROUNDED or None for the comparable() values of one column in an
+    eTerra record, its zeros taken out by eterra_value(), and in a delivery record."""
+    if before is None or after is None:
+        return None if before is after else ONE_SIDED
+    if not normalized_differ(before, after):
+        return None
+    if (column in ROUNDED_AREAS and is_number(before) and is_number(after)
+            and whole_metres(float(before), float(after))):
+        return ROUNDED
+    return CHANGED
+
+
 # the street number of a plot that has none: "FN", fără număr
 _WITHOUT_NUMBER = re.compile(r"f\.?\s*n\.?|-", re.IGNORECASE)
 
@@ -499,13 +599,30 @@ def address_difference(old, news, fold_text):
 
 # an int or real field cannot hold the joined values of the pieces, "501; 502"
 _NUMERIC_COLUMNS = {c.key for c in cgxml_columns.IMOBILE if c.kind in ("int", "real")}
+LAND_CLASS = "tip_teren"
+# the list columns that name persons, where a name written twice is two persons
+PERSON_COLUMNS = set(LIST_COLUMNS) - set(CODE_COLUMNS)
+# the columns whose value for a split imobil is worked out from its pieces (merged_record);
+# in any other column each piece holds a value of its own, compared one by one
+_MERGED_COLUMNS = (set(LIST_COLUMNS) | set(CODE_COLUMNS) | _NUMERIC_COLUMNS
+                   | {LAND_CLASS, "adresa"})
+
+
+def land_class_of(classes):
+    """Intravilan, Extravilan or Mixt for the whole of pieces with these classes, None when
+    no piece has one: the whole lies where all its pieces lie, else it is mixed."""
+    found = {value for value in classes if not _blank(value)}
+    if len(found) > 1:
+        return "Mixt"
+    return next(iter(found), None)
 
 
 def merged_record(entries, old=None) -> dict:
     """One record for an imobil split into the entries: every outline, the areas added up,
-    and for the other columns the common value, or the different values joined; a number
-    the pieces do not share is left empty. old is the imobil before the split: when every
-    piece repeats its deed area, that is the deed area of the whole."""
+    the land class of the whole, and for the other columns the common value, or the
+    different values joined; a number the pieces do not share is left empty. old is the
+    imobil before the split: when every piece repeats its deed area, that is the deed area
+    of the whole."""
     merged = dict(entries[0].record)
     records = [e.record for e in entries]
     for key in merged:
@@ -517,6 +634,8 @@ def merged_record(entries, old=None) -> dict:
                            else None)
             if key == DEED_AREA and _repeats_deed_area(values, old):
                 merged[key] = values[0]
+        elif key == LAND_CLASS:
+            merged[key] = land_class_of(values)
         elif len({str(v) for v in values}) > 1 and key in _NUMERIC_COLUMNS:
             merged[key] = None
         elif len({str(v) for v in values}) > 1:
@@ -567,8 +686,8 @@ def _outline(rings):
     parts = geometry.asGeometryCollection()
     if len(parts) < 2:
         return geometry
-    union = QgsGeometry.unaryUnion(parts)
-    return union if union is not None and not union.isEmpty() else geometry
+    union = overlay.union(parts)
+    return union if not union.isNull() and not union.isEmpty() else geometry
 
 
 def moved_within(old, new, distance) -> bool:
@@ -625,15 +744,21 @@ class CgxmlCompareTask(CadexTask):
         self.old_without_geometry = 0
         self.old_buildings_without_geometry = 0
         self.skipped_columns = []       # chosen columns the eTerra export leaves empty
-        # by IE, the eTerra export is the new source and the delivery the old one
+        # OLD_SIDE, NEW_SIDE or both: the sources that are eTerra exports (is_eterra_side)
+        self.eterra_sides: List[str] = []
+        # exactly one source is an eTerra export, so the rules for an export against a
+        # delivery apply
+        self.eterra = False
+        # the eTerra export is the new source and the delivery the old one
         self.reversed = False
-        # imobile and construcții with a value only one side has, by column, in IE mode
+        # imobile and construcții with a value only one side has, by column, with an export
         self.one_sided: Dict[str, int] = {}
         self.one_sided_buildings: Dict[str, int] = {}
         # and those whose area differs only by its rounding to whole square metres
         self.rounded: Dict[str, int] = {}
         self.rounded_buildings: Dict[str, int] = {}
-        # imobile and construcții whose boundary moved within COORDINATE_PRECISION, in IE mode
+        # imobile and construcții whose boundary moved within COORDINATE_PRECISION, with an
+        # export
         self.within_precision = {"imobile": 0, "constructii": 0}
 
     def _read(self, sources, side, start):
@@ -683,25 +808,28 @@ class CgxmlCompareTask(CadexTask):
             new_entries = self._read(new_sources, NEW_SIDE, 40.0)
             if self.stopped():
                 return False
-            self.reversed = (self.mode == IE and is_eterra_side(new_entries)
-                             and not is_eterra_side(old_entries))
+            self.eterra_sides = [side for side, entries in ((OLD_SIDE, old_entries),
+                                                            (NEW_SIDE, new_entries))
+                                 if is_eterra_side(entries)]
+            self.eterra = len(self.eterra_sides) == 1
+            self.reversed = self.eterra_sides == [NEW_SIDE]
+            older_side, newer_side = (old_entries, OLD_SIDE), (new_entries, NEW_SIDE)
             if self.reversed:
-                older = index_source(new_entries, self.mode, NEW_SIDE, delivery=False)
-                newer = index_source(old_entries, self.mode, OLD_SIDE, delivery=True)
-                eterra = new_entries
+                older_side, newer_side = newer_side, older_side
+            if self.mode == IE and not self.eterra:
+                pairs, missing = pair_by_ie(old_entries, new_entries)
             else:
-                older = index_source(old_entries, self.mode, OLD_SIDE)
-                newer = index_source(new_entries, self.mode, NEW_SIDE)
-                eterra = old_entries
-            self.ignored += older.ignored + newer.ignored
-            pairs, missing = pair_sources(older, newer)
+                older = index_source(older_side[0], self.mode, older_side[1], delivery=False)
+                newer = index_source(newer_side[0], self.mode, newer_side[1], delivery=True)
+                self.ignored += older.ignored + newer.ignored
+                pairs, missing = pair_sources(older, newer, export=self.eterra)
             self.matched = len(pairs)
             self.renamed = sum(1 for p in pairs if p.matched_by != "key")
-            if self.mode == IE and eterra:
+            if self.eterra:
                 self.skipped_columns = [
                     c for c in self.columns
                     if all(comparable(eterra_value(c, e.record.get(c)), self.fold_text, c) is None
-                           for e in eterra)]
+                           for e in older_side[0])]
 
             for state, key, first in missing:
                 for entry in [first] + first.pieces:
@@ -776,11 +904,11 @@ class CgxmlCompareTask(CadexTask):
         if self.compare_geometry:
             if unbuilt(old) or any(unbuilt(p.record) for p in pieces):
                 uncompared = True
-            elif self.mode == IE and not old.get("rings"):
+            elif self.eterra and not old.get("rings"):
                 self.old_without_geometry += 1
                 uncompared = True
             else:
-                moved = self._moved(old, new, "imobile")
+                moved, changes = self._moved(old, new, "imobile", changes)
         if newer.pieces:
             self.split += 1
             self.split_files += len(newer.pieces)
@@ -793,7 +921,8 @@ class CgxmlCompareTask(CadexTask):
             self.unchanged += 1
         if not self.buildings:
             return
-        owner = self._owner(newer)
+        # an imobil found otherwise than by its IE is named as its pair is, "ID 9001"
+        owner = pair.key if self.mode == IE and pair.matched_by != "key" else self._owner(newer)
         old_by = dict(pair.older.numbered)
         new_by = {}
         for piece in pieces:
@@ -814,11 +943,11 @@ class CgxmlCompareTask(CadexTask):
             if self.compare_geometry:
                 if unbuilt(before) or unbuilt(b):
                     b_uncompared = True
-                elif self.mode == IE and not before.get("rings"):
+                elif self.eterra and not before.get("rings"):
                     self.old_buildings_without_geometry += 1
                     b_uncompared = True
                 else:
-                    b_moved = self._moved(before, b, "constructii")
+                    b_moved, b_changes = self._moved(before, b, "constructii", b_changes)
             if b_changes or b_moved:
                 self.buildings_changed.append(Outcome(key, b, changes=b_changes, moved=b_moved,
                                                       imobil=owner, uncompared=b_uncompared,
@@ -829,26 +958,30 @@ class CgxmlCompareTask(CadexTask):
             if key not in new_by:
                 self.buildings_deleted.append(Outcome(key, b, imobil=owner))
 
-    def _moved(self, old, new, which):
-        """compare_shapes(); in IE mode a boundary that moved within COORDINATE_PRECISION is
-        no move, counted in within_precision."""
+    def _moved(self, old, new, which, changes):
+        """(compare_shapes(), changes). Against an eTerra export a boundary that moved within
+        COORDINATE_PRECISION is no move, counted in within_precision; changes then lose the
+        difference in measured area that the move accounts for: one no larger than the area
+        moved, allowing for the rounding of an area to whole square metres."""
         moved = compare_shapes(old, new, self.tolerance)
-        if moved is not None and self.mode == IE and moved_within(old, new, COORDINATE_PRECISION):
-            self.within_precision[which] += 1
-            return None
-        return moved
+        if moved is None or not self.eterra or not moved_within(old, new, COORDINATE_PRECISION):
+            return moved, changes
+        self.within_precision[which] += 1
+        return None, [(column, before, after) for column, before, after in changes
+                      if column != MEASURED_AREA or not is_number(before) or not is_number(after)
+                      or abs(after - before) > moved[2] + 0.5]
 
     def _changes(self, old, new, columns, one_sided, rounded, pieces=()):
         """[(column, old value, new value)] of the columns that differ. pieces are the new
         records of an imobil, more than one when it was split.
 
-        In IE mode an eTerra export and a delivery fill different columns, e.g. the deed area
-        or the fence, so a value only one side has is no change; nor is an area that differs
-        only by its rounding. They are counted in one_sided and rounded."""
+        An eTerra export and a delivery fill different columns, e.g. the deed area or the
+        fence, so between them a value only one side has is no change; nor is an area that
+        differs only by its rounding. They are counted in one_sided and rounded."""
         changes = []
         for column in columns:
             before, after = old.get(column), new.get(column)
-            if self.mode != IE:
+            if not self.eterra:
                 if values_differ(before, after, self.fold_text, column):
                     changes.append((column, before, after))
                 continue
@@ -866,19 +999,24 @@ class CgxmlCompareTask(CadexTask):
 
     def _eterra_difference(self, column, old, new, pieces):
         """CHANGED, ONE_SIDED, ROUNDED or None for one column of an eTerra record and a
-        delivery record."""
+        delivery record. For an imobil split into several pieces: its persons are those of
+        all the pieces, and a column outside _MERGED_COLUMNS, such as the fence, differs only
+        when every piece holds another value than eTerra."""
         if column == "adresa" and pieces:
             return address_difference(old, pieces, self.fold_text)
         before = comparable(eterra_value(column, old.get(column)), self.fold_text, column)
-        after = comparable(new.get(column), self.fold_text, column)
-        if before is None or after is None:
-            return None if before is after else ONE_SIDED
-        if not normalized_differ(before, after):
-            return None
-        if (column in ROUNDED_AREAS and isinstance(before, float) and isinstance(after, float)
-                and whole_metres(before, after)):
-            return ROUNDED
-        return CHANGED
+        if len(pieces) > 1 and column in PERSON_COLUMNS:
+            persons = Counter()
+            for piece in pieces:
+                # a person listed on two pieces is one person
+                persons |= counted(piece.get(column), self.fold_text, column)
+            return _difference(column, before, frozenset(persons.items()) or None)
+        if len(pieces) > 1 and column not in _MERGED_COLUMNS:
+            found = [_difference(column, before,
+                                 comparable(piece.get(column), self.fold_text, column))
+                     for piece in pieces]
+            return next((kind for kind in (None, ONE_SIDED, ROUNDED) if kind in found), CHANGED)
+        return _difference(column, before, comparable(new.get(column), self.fold_text, column))
 
     def one_sided_text(self):
         """"Împrejmuit la 75 de imobile, ..." for the values only one side has."""
@@ -906,7 +1044,8 @@ class CgxmlCompareTask(CadexTask):
         rows += self.kind_rows(self.changed, with_split=bool(self.split))
         rows.append((IMOBILE_UNCHANGED, self.unchanged))
         if self.renamed:
-            rows.append(("Imobile cu alt nume de fișier", self.renamed))
+            rows.append(("Imobile cu alt nume de fișier" if self.mode == FILENAME else
+                         "Imobile potrivite după numărul cadastral sau după nume", self.renamed))
         if self.split and not self.compare_geometry:
             rows.append(("Imobile din eTerra dezmembrate", self.split))
         if self.split_files:
@@ -937,10 +1076,43 @@ class CgxmlCompareTask(CadexTask):
             return []
         return kind_rows([kind_of(o) for o in outcomes], with_split)
 
+    def eterra_text(self) -> str:
+        """Which of the sources are eTerra exports, as the report states it."""
+        if len(self.eterra_sides) == 2:
+            return "Ambele surse"
+        return self.eterra_sides[0] if self.eterra_sides else "Niciuna dintre surse"
+
+    def renamed_text(self) -> str:
+        """The sentence on the imobile paired otherwise than by the key chosen, "" for
+        none."""
+        if not self.renamed:
+            return ""
+        imobile = fmt.count(self.renamed, "imobil", "imobile")
+        if self.mode == FILENAME:
+            return fmt.plural(
+                self.renamed,
+                "{0} are alt nume de fișier în sursa nouă și a fost găsit după IE sau după "
+                "numărul cadastral.",
+                "{0} au alt nume de fișier în sursa nouă și au fost găsite după IE sau după "
+                "numărul cadastral.").format(imobile)
+        return fmt.plural(
+            self.renamed,
+            "{0} fără pereche după IE a fost găsit după numărul cadastral sau după numele "
+            "fișierului.",
+            "{0} fără pereche după IE au fost găsite după numărul cadastral sau după numele "
+            "fișierului.").format(imobile)
+
     def notes(self):
         """Sentences about the sources and what was not compared, for the result window and
         Processing."""
         notes = []
+        if self.eterra:
+            notes.append(f"{self.eterra_sides[0]} a fost recunoscută ca export eTerra, după "
+                         "sectorul cadastral necompletat al imobilelor ei.")
+            if self.mode == FILENAME:
+                notes.append("Fișierele unui export eTerra și ale unei livrări au nume diferite, "
+                             "deci perechile s-au găsit după IE. Potrivirea după IE urmărește și "
+                             "imobilele din eTerra dezmembrate.")
         if self.skipped_columns:
             labels = ", ".join(cgxml_columns.label_of("imobile", c) for c in self.skipped_columns)
             notes.append(fmt.plural(
@@ -962,8 +1134,9 @@ class CgxmlCompareTask(CadexTask):
             notes.append("Suprafețele care diferă doar prin rotunjirea la metru pătrat nu s-au "
                          f"considerat modificări: {self.rounded_text()}.")
         if any(self.within_precision.values()):
-            notes.append("Limitele mutate cu cel mult 1 cm, cât este precizia coordonatelor, nu "
-                         f"s-au considerat modificări: {self.within_precision_text()}.")
+            notes.append("Limitele mutate cu cel mult 1 cm, cât este precizia coordonatelor, și "
+                         "diferența de suprafață măsurată care rezultă din ele nu s-au "
+                         f"considerat modificări: {self.within_precision_text()}.")
         imobile, constructii = self.old_without_geometry, self.old_buildings_without_geometry
         if imobile or constructii:
             what = " și ".join(text for count, text in (
@@ -1017,15 +1190,16 @@ class CgxmlCompareTask(CadexTask):
             (OLD_SIDE, "; ".join(self.old_paths)),
             (NEW_SIDE, "; ".join(self.new_paths)),
             ("Potrivirea fișierelor", MODE_NAMES[self.mode]),
+            ("Export eTerra", self.eterra_text()),
             ("Coloane comparate", ", ".join(cgxml_columns.label_of("imobile", c)
                                             for c in self.columns
                                             if c not in self.skipped_columns) or "-"),
             ("Valori completate doar într-o sursă, neconsiderate modificări",
-             self.one_sided_text() or "-") if self.mode == IE else None,
+             self.one_sided_text() or "-") if self.eterra else None,
             ("Suprafețe diferite doar prin rotunjire, neconsiderate modificări",
-             self.rounded_text() or "-") if self.mode == IE else None,
+             self.rounded_text() or "-") if self.eterra else None,
             ("Limite mutate cu cel mult 1 cm, neconsiderate modificări",
-             self.within_precision_text() or "-") if self.mode == IE else None,
+             self.within_precision_text() or "-") if self.eterra else None,
             ("Geometrie comparată", f"Da, toleranță {fmt.area(self.tolerance)}"
              if self.compare_geometry else "Nu"),
             ("Construcții comparate", self._buildings_fact()),
@@ -1048,10 +1222,15 @@ class CgxmlCompareTask(CadexTask):
                 + [["Nemodificate", self.buildings_unchanged, "", ""]],
                 row_colors=[xlsx_report.GOOD, xlsx_report.BAD, xlsx_report.MIXED]
                 + [None] * len(kinds) + [None])
-        summary.note(
-            "Imobilele au fost căutate în ambele surse după IE." if self.mode == IE else
-            "Imobilele au fost căutate în ambele surse după numele fișierului, iar cele al "
-            "căror fișier are alt nume în sursa nouă, după numărul cadastral sau după IE.")
+        if self.mode == FILENAME:
+            summary.note(
+                "Imobilele au fost căutate în ambele surse după numele fișierului, iar cele al "
+                "căror fișier are alt nume în sursa nouă, după numărul cadastral sau după IE.")
+        elif self.eterra:
+            summary.note("Imobilele au fost căutate în ambele surse după IE.")
+        else:
+            summary.note("Imobilele au fost căutate în ambele surse după IE, iar cele fără "
+                         "pereche, după numărul cadastral și după numele fișierului.")
         for note in self.notes():
             summary.note(note)
 

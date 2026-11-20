@@ -450,7 +450,8 @@ class BuildingTopologyTests(unittest.TestCase):
         self.assertEqual(rows["C3"]["stare"], bts.ELSEWHERE)
         self.assertIn("imobilul P2", rows["C3"]["obs_topo"])
         self.assertEqual(rows["C3"]["sup_inainte"], rows["C3"]["sup_dupa"])
-        self.assertTrue(rows["C3"]["geometry"].equals(QgsGeometry.fromWkt(square(95, 50, 20))))
+        self.assertTrue(helpers.same_geometry(rows["C3"]["geometry"],
+                                              QgsGeometry.fromWkt(square(95, 50, 20))))
         # C7 is linked to the imobil it mostly stands on, so it is cut
         self.assertEqual(rows["C7"]["stare"], bts.LOSS)
 
@@ -704,7 +705,7 @@ class BuildingTopologyCutTests(unittest.TestCase):
         self.assertEqual(row["obs_topo"], "Geometrie invalidă: conturul se intersectează cu el "
                                           "însuși în punctul 27,5 7,5. Nu a fost tăiată.")
         self.assertAlmostEqual(row["sup_inainte"], 12.5, places=4)
-        self.assertTrue(row["geometry"].equals(QgsGeometry.fromWkt(bow_tie)))
+        self.assertTrue(helpers.same_geometry(row["geometry"], QgsGeometry.fromWkt(bow_tie)))
 
     def test_an_unknown_link_on_no_imobil_is_noted_only_as_not_found(self):
         rows = self.run_task([("POLYGON((120 5, 125 5, 125 10, 120 10, 120 5))", ["C1", "9"]),
@@ -900,10 +901,9 @@ class CompareEngineLayerTests(unittest.TestCase):
         task = self.task()
         self.assertTrue(task.run(), task.error_msg)
         self.assertEqual((task.old_read, task.new_read), (4, 5))
-        _names, summary = xlsx.read_rows(task.excel_path, "Sumar")
-        rows = {r[0]: r[1] for r in summary if r}
-        self.assertEqual(rows["Înregistrări în layerul vechi"], 4)
-        self.assertEqual(rows["Înregistrări în layerul nou"], 5)
+        facts = helpers.summary_facts(task.excel_path)
+        self.assertEqual(facts["Înregistrări în layerul vechi"], 4)
+        self.assertEqual(facts["Înregistrări în layerul nou"], 5)
 
     def test_a_column_one_layer_lacks_stops_the_run_with_its_name(self):
         old = helpers.polygon_layer("vechi", [(square(0, 0, 10), [1, "A", "x"])],

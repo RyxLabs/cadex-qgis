@@ -21,9 +21,6 @@ from ..services.compare_service import (
     ADDED, ADDED_COLOR, CHANGED, CHANGED_COLOR, DELETED, DELETED_COLOR,
 )
 
-# the imobil identifier written by Conversie CGXML
-KEY_DEFAULT = "id"
-
 
 def _style(color):
     return lambda layer: layer_style.style_fill(layer, color)
@@ -67,18 +64,24 @@ class CompareLayersAlgorithm(CadexAlgorithm):
     TOOL = "compare_layers"
 
     def initAlgorithm(self, config=None):
-        # without a default the key would start on the first field, often fid, which only
-        # numbers the rows and pairs the wrong imobile once one is removed
+        # a key left empty is the one the Comparator window preselects
+        # (compare_service.layer_plan). An optional field starts empty in the panel; a required
+        # one would start on the first field, often fid, which only numbers the rows and pairs
+        # the wrong imobile once one is removed
         self.addParameter(QgsProcessingParameterFeatureSource(
             "OLD", self.tr("Versiunea veche"), [SOURCE_VECTOR]))
         self.addParameter(QgsProcessingParameterField(
-            "OLD_KEY", self.tr("Coloana cheie în versiunea veche"), defaultValue=KEY_DEFAULT,
-            parentLayerParameterName="OLD", type=FIELD_ANY))
+            "OLD_KEY", self.tr("Coloana cheie în versiunea veche"),
+            parentLayerParameterName="OLD", type=FIELD_ANY, optional=True))
         self.addParameter(QgsProcessingParameterFeatureSource(
             "NEW", self.tr("Versiunea nouă"), [SOURCE_VECTOR]))
         self.addParameter(QgsProcessingParameterField(
-            "NEW_KEY", self.tr("Coloana cheie în versiunea nouă"), defaultValue=KEY_DEFAULT,
-            parentLayerParameterName="NEW", type=FIELD_ANY))
+            "NEW_KEY", self.tr("Coloana cheie în versiunea nouă"),
+            parentLayerParameterName="NEW", type=FIELD_ANY, optional=True))
+        # an empty FIELDS means the columns compared by default, so comparing no column at
+        # all, the geometry alone, has a switch of its own
+        self.addParameter(QgsProcessingParameterBoolean(
+            "COMPARE_FIELDS", self.tr("Compară și coloanele"), True))
         self.addParameter(QgsProcessingParameterField(
             "FIELDS", self.tr("Coloanele de comparat"), parentLayerParameterName="OLD",
             type=FIELD_ANY, allowMultiple=True, optional=True))
@@ -123,8 +126,17 @@ class CompareLayersAlgorithm(CadexAlgorithm):
         old = self.snapshot(parameters, "OLD", context, feedback)
         new = self.snapshot(parameters, "NEW", context, feedback)
         infos = (self.layer_info("OLD"), self.layer_info("NEW"))
-        key_old, key_new = self._keys(parameters, context, old, new, infos)
+        plan = compare_service.layer_plan(
+            old.source, new.source, *infos,
+            keys=tuple(self.field_name(parameters, name, context)
+                       for name in ("OLD_KEY", "NEW_KEY")),
+            names=tuple(self.tr("Layerul '{0}'").format(s.name) for s in (old, new)))
+        key_old, key_new = plan.key_old, plan.key_new
         for snapshot, key in ((old, key_old), (new, key_new)):
+            if not key:
+                raise QgsProcessingException(self.tr(
+                    "Alegeți coloana cheie: în layerul '{0}' nu s-a găsit după nume coloana "
+                    "cu ID-ul sau IE-ul imobilului.").format(snapshot.name))
             if snapshot.fields.indexOf(key) < 0:
                 raise QgsProcessingException(self.tr(
                     "Layerul '{0}' nu are coloana '{1}'. Alegeți coloana cheie.").format(
@@ -132,20 +144,22 @@ class CompareLayersAlgorithm(CadexAlgorithm):
             self.refuse_row_number(key, snapshot, self.tr(
                 "Coloana '{0}' din '{1}' doar numerotează rândurile și nu poate potrivi "
                 "înregistrările celor două versiuni. Alegeți coloana cheie, de exemplu 'id'."))
-        self._eterra_warning(infos, (key_old, key_new), feedback)
-        fields = self.field_names(parameters, "FIELDS", context)
-        if not fields:
-            fields = _common_fields(old, new, (key_old, key_new), cgxml_compare.converted_columns(
-                *infos, cgxml_compare.DEFAULT_COLUMNS))
+        self._eterra_warning(plan.advice, infos, (key_old, key_new), feedback)
+        compare_fields = self.parameterAsBoolean(parameters, "COMPARE_FIELDS", context)
+        fields = []
+        if compare_fields:
+            fields = self.field_names(parameters, "FIELDS", context) or plan.ticked
         wants_geometry = self.parameterAsBoolean(parameters, "COMPARE_GEOMETRY", context)
         compare_geometry = wants_geometry and _spatial(old, new)
         if not fields and not compare_geometry:
             raise QgsProcessingException(self.tr(
-                "Layerele nu au coloane comune de comparat, iar geometria nu se compară."))
+                "Layerele nu au coloane comune de comparat, iar geometria nu se compară.")
+                if compare_fields else self.tr(
+                "Alegeți ce se compară: coloanele, geometria sau amândouă."))
         tolerance = self.parameterAsDouble(parameters, "TOLERANCE", context)
         fold_text = self.parameterAsBoolean(parameters, "FOLD_TEXT", context)
-        buildings = self._buildings_task(parameters, context, feedback, infos, wants_geometry,
-                                         tolerance, fold_text)
+        buildings = self._buildings_task(parameters, context, feedback, plan.imobil_column,
+                                         compare_fields, wants_geometry, tolerance, fold_text)
         task = self.run_task(compare_service.CompareTask(
             old=old, new=new, key_old=key_old, key_new=key_new, fields=fields,
             compare_geometry=compare_geometry, tolerance=tolerance,
@@ -163,60 +177,47 @@ class CompareLayersAlgorithm(CadexAlgorithm):
         self.report_output(task, results, "OUTPUT_XLSX", feedback)
         return results
 
-    def _keys(self, parameters, context, old, new, infos):
-        """The key columns chosen. Both left at 'id' for two Conversie CGXML layers, the
-        columns the window pairs them on (compare_service.key_columns)."""
-        keys = tuple(self.field_name(parameters, name, context) or KEY_DEFAULT
-                     for name in ("OLD_KEY", "NEW_KEY"))
-        if keys == (KEY_DEFAULT, KEY_DEFAULT) and all(info is not None and info.batch
-                                                      for info in infos):
-            resolved = compare_service.key_columns(old.source, new.source, *infos)
-            if all(resolved):
-                return resolved
-        return keys
-
-    def _eterra_warning(self, infos, keys, feedback):
-        """Advice for a converted eTerra export compared with a delivery."""
-        names = tuple(self.tr("Layerul '{0}'").format(info.name) if info is not None else ""
-                      for info in infos)
-        advice = cgxml_compare.eterra_advice(*infos, names)
+    def _eterra_warning(self, advice, infos, keys, feedback):
+        """Push LayerPlan.advice as a warning, for a converted eTerra export compared with a
+        delivery, with a hint to pair by 'ie' when a key is the imobil's ID."""
         if not advice:
             return
-        id_columns = {info.column_of("id") for info in infos} - {None}
+        id_columns = {info.column_of("id") for info in infos if info is not None} - {None}
         if id_columns & set(keys):
             advice += self.tr(" Potriviți imobilele după 'ie': numerele cadastrale din "
                               "exportul eTerra nu sunt ID-urile din livrare.")
         feedback.pushWarning(self.tr(advice))
 
-    def _buildings_task(self, parameters, context, feedback, infos, wants_geometry, tolerance,
-                        fold_text):
-        """The CompareTask of the construcții layers, None without them. infos are the
-        LayerInfo of the imobile layers."""
+    def _buildings_task(self, parameters, context, feedback, imobil_column, compare_fields,
+                        wants_geometry, tolerance, fold_text):
+        """The CompareTask of the construcții layers, None without them. imobil_column is
+        LayerPlan.imobil_column of the imobile layers; with compare_fields False only the
+        geometry is compared."""
         chosen = [bool(parameters.get(f"{side}_BUILDINGS")) for side in ("OLD", "NEW")]
         if not any(chosen):
             return None
         if not all(chosen):
             raise QgsProcessingException(self.tr(
                 "Alegeți ambele layere de construcții sau niciunul."))
-        # the cadastral numbers of an eTerra export are not the IDs of a delivery
-        eterra = bool(cgxml_compare.eterra_advice(*infos))
-        snapshots, keys, building_infos = [], [], []
+        snapshots, building_infos, picked = [], [], []
         for side in ("OLD", "NEW"):
-            snapshot = self.snapshot(parameters, f"{side}_BUILDINGS", context, feedback)
-            snapshots.append(snapshot)
-            info = self.layer_info(f"{side}_BUILDINGS")
-            building_infos.append(info)
-            imobil = self.field_name(parameters, f"{side}_BUILDING_IMOBIL", context)
-            if not imobil and info is not None:
-                imobil = info.column_of("ie_imobil" if eterra else "id")
-                if eterra and not imobil:
-                    raise QgsProcessingException(self.tr(
-                        "Construcțiile unui export eTerra se potrivesc cu cele ale livrării "
-                        "după IE-ul imobilului, pe care layerul '{0}' nu îl are. Alegeți coloana "
-                        "imobilului în ambele layere de construcții sau comparați fișierele "
-                        "CGXML.").format(info.name))
-            number = (self.field_name(parameters, f"{side}_BUILDING_NUMBER", context)
-                      or (info.column_of("nr_constr") if info is not None else None))
+            snapshots.append(self.snapshot(parameters, f"{side}_BUILDINGS", context, feedback))
+            building_infos.append(self.layer_info(f"{side}_BUILDINGS"))
+            picked.append(tuple(self.field_name(parameters, f"{side}_BUILDING_{column}", context)
+                                for column in ("IMOBIL", "NUMBER")))
+        old, new = snapshots
+        plan = compare_service.building_plan(old.source, new.source, *building_infos,
+                                             imobil_column=imobil_column, keys=picked)
+        keys = []
+        for snapshot, info, (imobil, number) in zip(snapshots, building_infos,
+                                                    (plan.key_old, plan.key_new)):
+            # the imobile pair on their IE: their cadastral numbers do not pair the buildings
+            if not imobil and info is not None and imobil_column == "ie_imobil":
+                raise QgsProcessingException(self.tr(
+                    "Imobilele se potrivesc după IE, deci construcțiile se potrivesc după "
+                    "IE-ul imobilului lor, pe care layerul '{0}' nu îl are. Alegeți coloana "
+                    "imobilului în ambele layere de construcții sau comparați fișierele "
+                    "CGXML.").format(info.name))
             if not number:
                 raise QgsProcessingException(self.tr(
                     "Alegeți coloana cu numărul construcției pentru ambele layere de "
@@ -231,11 +232,9 @@ class CompareLayersAlgorithm(CadexAlgorithm):
         if len(keys[0]) != len(keys[1]):
             raise QgsProcessingException(self.tr(
                 "Alegeți coloana imobilului în ambele layere de construcții sau în niciunul."))
-        old, new = snapshots
-        fields = self.field_names(parameters, "BUILDING_FIELDS", context)
-        if not fields:
-            fields = _common_fields(old, new, keys[0] + keys[1], cgxml_compare.converted_columns(
-                *building_infos, cgxml_compare.BUILDING_COLUMNS))
+        fields = []
+        if compare_fields:
+            fields = self.field_names(parameters, "BUILDING_FIELDS", context) or plan.ticked
         return compare_service.CompareTask(
             old=old, new=new, key_old=keys[0], key_new=keys[1], fields=fields,
             compare_geometry=wants_geometry and _spatial(old, new), tolerance=tolerance,
@@ -256,6 +255,9 @@ class CompareLayersAlgorithm(CadexAlgorithm):
                 feedback.pushWarning(lead + self.tr("Cheia {0} apare de {1} în layerul {2}; "
                                                     "s-a comparat primul rând.").format(
                     key, fmt.count(count, self.tr("dată"), self.tr("ori")), side))
+
+        if task.geometry_note():
+            feedback.pushInfo(self.tr(task.geometry_note()))
 
         results.update({prefix + "ADDED": len(task.added), prefix + "DELETED": len(task.deleted),
                         prefix + "CHANGED": len(task.changed_keys()),
@@ -280,13 +282,6 @@ def _has_geometry(wkb_type):
 
 def _spatial(old, new):
     return all(_has_geometry(s.wkb_type) for s in (old, new))
-
-
-def _common_fields(old, new, keys, chosen=None):
-    """The data columns both snapshots have, keys left out; with chosen, only those."""
-    new_names = set(new.data_field_names())
-    return [n for n in old.data_field_names() if n in new_names and n not in keys
-            and (chosen is None or n in chosen)]
 
 
 def _columns_parameter(name, description, columns, defaults):

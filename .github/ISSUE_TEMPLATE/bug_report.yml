@@ -1,0 +1,76 @@
+name: Raportați o problemă
+description: O eroare sau un rezultat greșit în CADex
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Această pagină este publică. **Nu atașați fișiere CGXML reale și nici capturi de ecran în care apar nume, CNP-uri, adrese sau numere cadastrale.** Descrieți problema în cuvinte sau reproduceți-o pe date inventate. Dacă problema apare doar pe un fișier real, scrieți la suport@cadex.ro.
+  - type: input
+    id: cadex
+    attributes:
+      label: Versiunea CADex
+      description: O găsiți în QGIS, la Plugins > Manage and Install Plugins > Installed > CADex.
+      placeholder: "0.3.0"
+    validations:
+      required: true
+  - type: input
+    id: qgis
+    attributes:
+      label: Versiunea QGIS
+      description: O găsiți în QGIS, la Help > About.
+      placeholder: "3.44.15"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Sistemul de operare
+      placeholder: "Windows 11"
+    validations:
+      required: true
+  - type: dropdown
+    id: tool
+    attributes:
+      label: Instrumentul
+      options:
+        - Conversie CGXML
+        - Raport Intravilan / Extravilan
+        - Diminuare Suprafețe
+        - Comparator
+        - Verificare Topologică
+        - Topologie Construcții
+        - Setări
+        - Un algoritm din Processing Toolbox
+        - Altceva
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Pașii până la problemă
+      description: Ce ați ales în fereastră și pe ce buton ați apăsat, în ordine.
+      placeholder: |
+        1. Am deschis Conversie CGXML și am ales un folder cu 120 de fișiere.
+        2. Am ales formatul GeoPackage și am apăsat Convertește.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Ce s-a întâmplat și ce așteptați să se întâmple
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Mesajele din fila CADex a jurnalului
+      description: În QGIS, deschideți View > Panels > Log Messages și copiați aici conținutul filei CADex. Ștergeți din text numele și căile care nu trebuie să fie publice.
+      render: text
+  - type: checkboxes
+    id: public
+    attributes:
+      label: Date publice
+      options:
+        - label: Nu am atașat fișiere CGXML reale și nici capturi de ecran cu nume, CNP-uri, adrese sau numere cadastrale.
+          required: true

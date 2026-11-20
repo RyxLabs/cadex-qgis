@@ -12,6 +12,13 @@ from dataclasses import dataclass
 # dBase limits: 10 characters per field name, 254 bytes per text value
 SHP_NAME_LIMIT = 10
 SHP_TEXT_LIMIT = 254
+# minimum widths of Shapefile text columns, in bytes. A dBase column keeps the width it is
+# created with, and QGIS refuses longer text typed into it later, so a column that is empty
+# or short at conversion is still created wide enough for later edits: SHP_TEXT_LIMIT for
+# free text, SHP_NAME_ROOM for a name, an identifier or a list of numbers, SHP_CODE_ROOM for
+# a code or one short number
+SHP_NAME_ROOM = 80
+SHP_CODE_ROOM = 20
 
 _VALID_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # the column GDAL creates for the feature number and the one holding the geometry; a field of
@@ -27,6 +34,7 @@ class Column:
     label: str          # shown in the dialog and as the Excel header
     on: bool = True     # written by default
     hint: str = ""      # tooltip: the CGXML element or the possible values
+    room: int = SHP_NAME_ROOM   # minimum width of a text column in a Shapefile, in bytes
 
 
 IMOBILE = (
@@ -36,47 +44,51 @@ IMOBILE = (
     Column("judet", "judet", "text", "Județ", on=False),
     Column("uat", "uat", "text", "UAT"),
     Column("localitate", "localitate", "text", "Localitate"),
-    Column("adresa", "adresa", "text", "Adresa completă"),
-    Column("desc_adresa", "desc_adr", "text", "Descrierea adresei", on=False),
-    Column("nr_postal", "nr_postal", "text", "Nr. poștal"),
+    Column("adresa", "adresa", "text", "Adresa completă", room=SHP_TEXT_LIMIT),
+    Column("desc_adresa", "desc_adr", "text", "Descrierea adresei", on=False,
+           room=SHP_TEXT_LIMIT),
+    Column("nr_postal", "nr_postal", "text", "Nr. poștal", room=SHP_CODE_ROOM),
     Column("tip_teren", "tip_teren", "text", "Intravilan / Extravilan",
-           hint="Intravilan, Extravilan sau Mixt"),
+           hint="Intravilan, Extravilan sau Mixt", room=SHP_CODE_ROOM),
     Column("nr_tarla", "nr_tarla", "text", "Nr. tarla"),
     Column("nr_parcele", "nr_parcele", "text", "Nr. parcelă"),
     Column("categ_fol", "categ_fol", "text", "Categorii de folosință",
            hint="Codurile categoriilor, de exemplu CC, A"),
     Column("nr_titlu", "nr_titlu", "text", "Nr. titlu de proprietate"),
-    Column("imprej", "imprej", "text", "Împrejmuit", hint="Da sau Nu"),
+    Column("imprej", "imprej", "text", "Împrejmuit", hint="Da sau Nu", room=SHP_CODE_ROOM),
     Column("sup_mas", "sup_mas", "real", "Suprafața măsurată (mp)"),
     Column("sup_acte", "sup_acte", "real", "Suprafața din acte (mp)"),
-    Column("propr", "propr", "text", "Proprietari și posesori"),
+    Column("propr", "propr", "text", "Proprietari și posesori", room=SHP_TEXT_LIMIT),
     Column("alte_pers", "alte_pers", "text", "Alte persoane", hint=(
         "Celelalte persoane din fișier, fiecare cu dreptul sau înscrierea ei, de exemplu "
-        "ipotecă, administrare sau notare, și cu locul, dacă nu sunt legate de teren")),
+        "ipotecă, administrare sau notare, și cu locul, dacă nu sunt legate de teren"),
+        room=SHP_TEXT_LIMIT),
     Column("nr_cad_vechi", "cad_vechi", "text", "Nr. cadastral vechi", hint="PAPERCADNO"),
     Column("nr_cf_vechi", "cf_vechi", "text", "Nr. CF vechi", hint="PAPERLBNO"),
-    Column("note", "note", "text", "Note"),
+    Column("note", "note", "text", "Note", room=SHP_TEXT_LIMIT),
 )
 
 CONSTRUCTII = (
     Column("id", "id", "int", "ID imobil", hint="CADGENNO"),
     Column("ie_imobil", "ie_imobil", "int", "Identificator electronic al imobilului", on=False),
     Column("sector", "sector", "int", "Sector cadastral", hint="CADSECTOR"),
-    Column("nr_constr", "nr_constr", "text", "Nr. construcție", hint="C1, C2..."),
+    Column("nr_constr", "nr_constr", "text", "Nr. construcție", hint="C1, C2...",
+           room=SHP_CODE_ROOM),
     Column("ie", "ie", "text", "Identificator electronic al construcției", hint="E2IDENTIFIER"),
     Column("tip_teren", "tip_teren", "text", "Intravilan / Extravilan",
-           hint="Intravilan, Extravilan sau Mixt"),
-    Column("destinatie", "destinatie", "text", "Destinația (cod)", hint="CL, CA, CIE sau CAS"),
+           hint="Intravilan, Extravilan sau Mixt", room=SHP_CODE_ROOM),
+    Column("destinatie", "destinatie", "text", "Destinația (cod)", hint="CL, CA, CIE sau CAS",
+           room=SHP_CODE_ROOM),
     Column("destinatie_text", "dest_text", "text", "Destinația (denumire)", on=False),
     Column("etaje", "etaje", "int", "Nr. niveluri"),
     Column("sup_mas", "sup_mas", "real", "Suprafața construită la sol (mp)"),
     Column("sup_tot", "sup_tot", "real", "Suprafața construită desfășurată (mp)"),
-    Column("are_acte", "are_acte", "text", "Are acte", hint="Da sau Nu"),
-    Column("propr", "propr", "text", "Proprietari"),
+    Column("are_acte", "are_acte", "text", "Are acte", hint="Da sau Nu", room=SHP_CODE_ROOM),
+    Column("propr", "propr", "text", "Proprietari", room=SHP_TEXT_LIMIT),
     Column("alte_pers", "alte_pers", "text", "Alte persoane", hint=(
         "Celelalte persoane legate de construcție sau de unitățile ei individuale, fiecare "
-        "cu dreptul sau înscrierea ei")),
-    Column("note", "note", "text", "Note"),
+        "cu dreptul sau înscrierea ei"), room=SHP_TEXT_LIMIT),
+    Column("note", "note", "text", "Note", room=SHP_TEXT_LIMIT),
 )
 
 SPECS = {"imobile": IMOBILE, "constructii": CONSTRUCTII}
@@ -142,6 +154,15 @@ def hint_of(which: str, key: str) -> str:
         if column.key == key:
             return column.hint
     return ""
+
+
+def shapefile_width(which: str, key: str, longest: int) -> int:
+    """Bytes of a text column in a Shapefile: the room of the column, or the longest value
+    written to it when that takes more, up to the dBase limit."""
+    for column in SPECS[which]:
+        if column.key == key:
+            return min(max(column.room, longest), SHP_TEXT_LIMIT)
+    return min(max(SHP_NAME_ROOM, longest), SHP_TEXT_LIMIT)
 
 
 def output_names(layout: list, shapefile: bool) -> list:
