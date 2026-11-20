@@ -287,6 +287,17 @@ class ReleaseNotesTests(unittest.TestCase):
         self.checkout(metadata=METADATA.replace("    Fixed:\n", ""))
         self.assertIn("under the same headings", self.refusal())
 
+    def test_entries_under_a_romanian_heading_are_notes_the_plugin_manager_must_show(self):
+        changelog = CHANGELOG.replace(
+            "### Added", "### Corectat\n\n- Suprafața unui imobil cu gol.\n\n### Added")
+        metadata = METADATA.replace(
+            "    Added:", "    Corectat:\n    * Suprafața unui imobil cu gol\n    Added:")
+        self.checkout(changelog, metadata)
+        self.assertIn("### Corectat\n\n- Suprafața unui imobil cu gol.\n",
+                      self.release_notes.notes("v1.2.3", self.root))
+        self.checkout(changelog)
+        self.assertIn("under the same headings", self.refusal())
+
 
 def sqlite_file(path, script):
     db = sqlite3.connect(path)

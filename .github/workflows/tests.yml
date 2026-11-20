@@ -134,7 +134,8 @@ jobs:
   package:
     name: upload checks and Python 3.9
     needs: zip
-    runs-on: ubuntu-latest
+    # setup-python has Python 3.9 for Ubuntu 22.04 and 24.04, not for later releases
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     defaults:
       run:

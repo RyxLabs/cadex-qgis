@@ -22,8 +22,9 @@ SECTION = re.compile(r"^## (\d+\.\d+\.\d+)(?:\s+-\s+(.*))?$")
 VERSION_LINE = re.compile(r"^(\d+\.\d+\.\d+):?$")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # "### Fixed" in CHANGELOG.md, "Fixed:" in the changelog of metadata.txt, which the Plugin
-# Manager shows as plain text
-KINDS = "Added|Changed|Deprecated|Removed|Fixed|Security"
+# Manager shows as plain text; the Romanian entries come first, under the Romanian headings
+KINDS = ("Adăugat|Modificat|Învechit|Eliminat|Corectat|Securitate|"
+         "Added|Changed|Deprecated|Removed|Fixed|Security")
 HEADING = re.compile(rf"^(?:### ({KINDS})|({KINDS}):)$")
 
 
